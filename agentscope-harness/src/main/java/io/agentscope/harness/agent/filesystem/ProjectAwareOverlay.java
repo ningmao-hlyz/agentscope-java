@@ -131,6 +131,15 @@ public class ProjectAwareOverlay extends OverlayFilesystem implements AbstractSa
     // ==================== Write routing ====================
 
     @Override
+    public AtomicTextFile atomicTextFile(
+            RuntimeContext runtimeContext, String path, boolean inheritLower) {
+        String target = toWorkspaceRelativePath(runtimeContext, path);
+        return isWorkspacePath(runtimeContext, path)
+                ? super.atomicTextFile(runtimeContext, target, inheritLower)
+                : projectFs.atomicTextFile(runtimeContext, target, inheritLower);
+    }
+
+    @Override
     public WriteResult write(RuntimeContext runtimeContext, String filePath, String content) {
         String target = toWorkspaceRelativePath(runtimeContext, filePath);
         if (isWorkspacePath(runtimeContext, filePath)) {

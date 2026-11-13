@@ -42,6 +42,13 @@ import java.util.Map;
  * should pass {@link RuntimeContext#empty()}.
  */
 public interface AbstractFilesystem {
+    /** Atomic UTF-8 updates; {@code inheritLower=false} isolates state from shared layers. */
+    default AtomicTextFile atomicTextFile(
+            RuntimeContext context, String path, boolean inheritLower) {
+        throw new UnsupportedOperationException(
+                "Filesystem does not support atomic text updates: " + getClass().getName());
+    }
+
     /** Optional durable atomic storage capability. No silent fallback to local or unversioned writes. */
     default io.agentscope.core.session.AtomicSessionStorage sessionStorage(RuntimeContext context) {
         throw new UnsupportedOperationException(

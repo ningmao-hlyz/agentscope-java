@@ -279,7 +279,7 @@ public class WorkspaceIndex implements AutoCloseable {
             ps.setString(1, likePrefix(prefix));
             try (ResultSet rs = ps.executeQuery()) {
                 while (rs.next()) {
-                    result.add(rs.getString(1));
+                    if (isIndexable(rs.getString(1))) result.add(rs.getString(1));
                 }
             }
         } catch (Exception e) {
@@ -298,11 +298,12 @@ public class WorkspaceIndex implements AutoCloseable {
         }
         try (PreparedStatement ps =
                 conn.prepareStatement(
-                        "SELECT 1 FROM files WHERE path LIKE ? ESCAPE '\\' AND present_local=1"
-                                + " LIMIT 1")) {
+                        "SELECT path FROM files WHERE path LIKE ? ESCAPE '\\' AND"
+                                + " present_local=1")) {
             ps.setString(1, likePrefix(prefix));
             try (ResultSet rs = ps.executeQuery()) {
-                return rs.next();
+                while (rs.next()) if (isIndexable(rs.getString(1))) return true;
+                return false;
             }
         } catch (Exception e) {
             log.debug("Index hasPrefix failed (non-fatal): {}", e.getMessage());
@@ -376,7 +377,7 @@ public class WorkspaceIndex implements AutoCloseable {
      * indexed directory prefixes.
      */
     static boolean isIndexable(String path) {
-        if (path == null || path.isBlank()) {
+        if (path == null || path.isBlank() || path.endsWith(".cas-lock")) {
             return false;
         }
         for (String prefix : INDEXED_PREFIXES) {

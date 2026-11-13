@@ -574,3 +574,7 @@ HarnessAgent.builder()
 - [技能](/v2/zh/docs/harness/skill) — 四层合成、自学习闭环、`<available_skills>` 块
 - [工具](/v2/zh/docs/building-blocks/tool) — `read_file` / `write_file` / `execute` 等参数
 - [架构](/v2/zh/docs/harness/architecture) — 文件系统与运行时上下文如何协作
+
+## 条件文本写入
+
+`AbstractFilesystem.atomicTextFile(rc, path, inheritLower)` 提供 UTF-8 读取、条件替换和条件删除。本地文件使用操作系统锁与原子重命名；远端存储必须提供原生条件写入。Overlay 实现保留路由和写时复制行为。自定义后端可不支持此可选接口，此时 `WorkspaceManager.appendMemoryFileUtf8` 沿用旧追加方式，不保证跨副本并发安全。

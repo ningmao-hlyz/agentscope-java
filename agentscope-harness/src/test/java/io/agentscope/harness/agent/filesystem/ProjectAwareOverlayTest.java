@@ -85,6 +85,19 @@ class ProjectAwareOverlayTest {
     // ==================== Write routing ====================
 
     @Test
+    void atomicUpdatesFollowProjectAndWorkspaceRouting() throws Exception {
+        AtomicTextFile source = overlay.atomicTextFile(rc, "src/atomic.txt", true);
+        assertTrue(source.compareAndSet(null, "project content"));
+        assertTrue(Files.exists(project.resolve("src/atomic.txt")));
+        assertFalse(Files.exists(workspace.resolve("src/atomic.txt")));
+        String absoluteMemory = workspace.resolve("MEMORY.md").toString();
+        assertTrue(overlay.atomicTextFile(rc, absoluteMemory, true).compareAndSet(null, "memory"));
+        assertEquals(
+                "memory", Files.readString(workspace.resolve("MEMORY.md"), StandardCharsets.UTF_8));
+        assertFalse(Files.exists(project.resolve("MEMORY.md")));
+    }
+
+    @Test
     void write_projectFile_landsInProjectDir() {
         WriteResult r = overlay.write(rc, "src/App.java", "public class App {}");
         assertTrue(r.isSuccess(), () -> "write failed: " + r.error());

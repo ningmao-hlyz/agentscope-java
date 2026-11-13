@@ -31,9 +31,11 @@ import com.fasterxml.jackson.databind.SerializationFeature;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import io.agentscope.core.agent.RuntimeContext;
 import io.agentscope.harness.agent.filesystem.AbstractFilesystem;
+import io.agentscope.harness.agent.filesystem.AtomicTextFile;
 import io.agentscope.harness.agent.filesystem.CompositeFilesystem;
 import io.agentscope.harness.agent.filesystem.OverlayFilesystem;
 import io.agentscope.harness.agent.filesystem.RoutedSandboxFilesystem;
+import io.agentscope.harness.agent.filesystem.local.LocalAtomicTextFile;
 import io.agentscope.harness.agent.filesystem.local.LocalFilesystem;
 import io.agentscope.harness.agent.filesystem.model.FileInfo;
 import io.agentscope.harness.agent.filesystem.model.GlobResult;
@@ -341,8 +343,9 @@ public class WorkspaceManager implements AutoCloseable {
     /**
      * Appends to a memory-family UTF-8 file. Host-side append when the filesystem serving the
      * path is the per-call sandbox proxy (the fire-and-forget flush runs after the stream —
-     * and possibly the sandbox — is gone, #3110); otherwise the standard filesystem
-     * read-merge-write append.
+     * and possibly the sandbox — is gone, #3110). Appends use CAS so concurrent flushes and
+     * memory-save tools do not overwrite one another across instances or replicas when the
+     * backend supports atomic updates. Legacy custom filesystems retain their original append.
      */
     public void appendMemoryFileUtf8(RuntimeContext rc, String relativePath, String content) {
         if (relativePath == null || content == null) {
@@ -352,18 +355,68 @@ public class WorkspaceManager implements AutoCloseable {
         if (normalized.isEmpty()) {
             return;
         }
-        if (memoryFilesRouteToLiveSandbox(normalized)) {
-            ReentrantLock lock = pathLocks.computeIfAbsent(normalized, k -> new ReentrantLock());
-            lock.lock();
-            try {
-                appendLocalPath(
-                        resolveRuntimeDataPath(rc, normalized).normalize(), normalized, content);
-            } finally {
-                lock.unlock();
-            }
+        AtomicTextFile file;
+        try {
+            file = atomicMemoryFile(rc, normalized);
+        } catch (UnsupportedOperationException unsupported) {
+            log.debug("Non-atomic memory append on legacy backend: {}", normalized);
+            appendUtf8WorkspaceRelative(rc, normalized, content);
             return;
         }
-        appendUtf8WorkspaceRelative(rc, relativePath, content);
+        for (int attempt = 0; attempt < 20; attempt++) {
+            String before = file.read();
+            if (file.compareAndSet(before, (before == null ? "" : before) + content)) return;
+        }
+        throw new IllegalStateException("Repeated memory append conflict: " + normalized);
+    }
+
+    /**
+     * Authoritative memory-file IO for extraction receipts and recoverable ledger appends.
+     * No fallback on a read error: treating an unavailable file as missing can lose progress.
+     * All callers sharing this path must use the backend's CAS protocol for concurrent writes.
+     */
+    public AtomicTextFile atomicMemoryFile(RuntimeContext rc, String relativePath) {
+        String normalized = requireSafeRelativePath(relativePath);
+        if (!normalized.equals(MEMORY_MD) && !normalized.startsWith(MEMORY_DIR + "/")) {
+            throw new IllegalArgumentException(
+                    "Atomic memory path must be MEMORY.md or under memory/");
+        }
+        AtomicTextFile delegate;
+        if (memoryFilesRouteToLiveSandbox(normalized)) {
+            delegate = new LocalAtomicTextFile(resolveRuntimeDataPath(rc, normalized));
+        } else if (filesystem == null) {
+            delegate = new LocalAtomicTextFile(workspace.resolve(normalized));
+        } else {
+            delegate = filesystem.atomicTextFile(rc, normalized, true);
+        }
+        return new AtomicTextFile() {
+            @Override
+            public String read() {
+                return delegate.read();
+            }
+
+            @Override
+            public boolean compareAndSet(String expected, String updated) {
+                boolean changed = delegate.compareAndSet(expected, updated);
+                if (changed && index != null) {
+                    index.upsert(normalized, updated.getBytes(StandardCharsets.UTF_8).length, null);
+                }
+                return changed;
+            }
+
+            @Override
+            public boolean compareAndDelete(String expected) {
+                boolean changed = delegate.compareAndDelete(expected);
+                if (changed && index != null) {
+                    index.remove(normalized);
+                    String current = delegate.read();
+                    if (current != null)
+                        index.upsert(
+                                normalized, current.getBytes(StandardCharsets.UTF_8).length, null);
+                }
+                return changed;
+            }
+        };
     }
 
     /**
@@ -560,11 +613,7 @@ public class WorkspaceManager implements AutoCloseable {
     }
 
     private boolean isLiveSandboxServingPath(String relPath) {
-        AbstractFilesystem fs = this.filesystem;
-        if (fs instanceof RoutedSandboxFilesystem routed) {
-            fs = routed.backendFor(relPath);
-        }
-        return fs instanceof SandboxBackedFilesystem;
+        return taskFilesystem(relPath) instanceof SandboxBackedFilesystem;
     }
 
     /**

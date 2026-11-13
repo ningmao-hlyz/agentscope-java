@@ -81,6 +81,15 @@ public interface BaseStore {
     }
 
     /**
+     * Updates the observed snapshot, or creates when expected is null. The default uses version
+     * CAS; backends that allow deletion and version reuse must atomically compare value too.
+     */
+    default boolean putIfUnchanged(
+            List<String> namespace, String key, Map<String, Object> value, StoreItem expected) {
+        return putIfVersion(namespace, key, value, expected == null ? 0 : expected.version());
+    }
+
+    /**
      * Search for items within a namespace with pagination.
      *
      * @param namespace hierarchical namespace path
@@ -97,4 +106,13 @@ public interface BaseStore {
      * @param key the item key to delete
      */
     void delete(List<String> namespace, String key);
+
+    /**
+     * Atomically deletes the observed item, matching both version and value even after recreation.
+     * Version reuse also requires snapshot-safe {@link #putIfUnchanged}. Unsupported backends
+     * return false; never implement this as get followed by delete.
+     */
+    default boolean deleteIfUnchanged(List<String> namespace, String key, StoreItem expected) {
+        return false;
+    }
 }

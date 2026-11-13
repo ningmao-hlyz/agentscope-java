@@ -108,6 +108,22 @@ class BaseStoreContractTest {
     }
 
     @Test
+    void conditionalDeleteChecksValueEvenWhenRecreationReusesVersion() {
+        BaseStore store = newStore();
+        List<String> ns = List.of("delete-cas");
+        store.put(ns, "k", Map.of("v", "original"));
+        StoreItem before = store.get(ns, "k");
+        store.delete(ns, "k");
+        store.put(ns, "k", Map.of("v", "recreated"));
+        assertEquals(before.version(), store.get(ns, "k").version());
+        assertFalse(store.deleteIfUnchanged(ns, "k", before));
+        assertEquals("recreated", store.get(ns, "k").value().get("v"));
+        assertTrue(store.deleteIfUnchanged(ns, "k", store.get(ns, "k")));
+        assertNull(store.get(ns, "k"));
+        assertFalse(store.deleteIfUnchanged(ns, "k", before));
+    }
+
+    @Test
     void search_includesChildNamespaceItems() {
         BaseStore store = newStore();
 

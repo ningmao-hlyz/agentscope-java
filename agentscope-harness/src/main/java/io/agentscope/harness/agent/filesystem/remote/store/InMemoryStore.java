@@ -102,6 +102,26 @@ public class InMemoryStore implements BaseStore {
         store.remove(compoundKey(namespace, key));
     }
 
+    @Override
+    public boolean putIfUnchanged(
+            List<String> namespace, String key, Map<String, Object> value, StoreItem expected) {
+        boolean[] written = {false};
+        store.compute(
+                compoundKey(namespace, key),
+                (k, current) -> {
+                    if (!java.util.Objects.equals(current, expected)) return current;
+                    written[0] = true;
+                    return new StoreItem(key, value, current == null ? 1 : current.version() + 1);
+                });
+        return written[0];
+    }
+
+    @Override
+    public boolean deleteIfUnchanged(List<String> namespace, String key, StoreItem expected) {
+        return store.remove(
+                compoundKey(namespace, key), java.util.Objects.requireNonNull(expected));
+    }
+
     /** Returns the number of items currently stored. */
     public int size() {
         return store.size();

@@ -52,6 +52,19 @@ class WorkspaceIndexPrefixMatchTest {
     }
 
     @Test
+    void lockFilesAreExcludedFromIndexAndDiskRebuild() throws Exception {
+        String internal = "memory/2026-11-13.md.cas-lock";
+        Path state = workspaceRoot.resolve(internal);
+        java.nio.file.Files.createDirectories(state.getParent());
+        java.nio.file.Files.writeString(state, "{}", java.nio.charset.StandardCharsets.UTF_8);
+        index.upsert(internal, 2, null);
+        index.rebuildFromDisk(workspaceRoot);
+        assertFalse(index.exists(internal));
+        assertFalse(index.hasPrefix("memory/"));
+        assertTrue(index.listByPrefix("memory/").isEmpty());
+    }
+
+    @Test
     void listByPrefixTreatsUnderscoreInAgentAndSessionNamesLiterally() {
         index.upsert("agents/bot_1/sessions/s_1/report.md", 7, null);
         // Same shape, different characters: 'bot21'/'s21' line up with 'bot_1'/'s_1' once

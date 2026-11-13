@@ -80,6 +80,11 @@ public final class RoutedSandboxFilesystem implements AbstractSandboxFilesystem 
     }
 
     @Override
+    public AtomicTextFile atomicTextFile(RuntimeContext rc, String path, boolean inheritLower) {
+        return composite.atomicTextFile(rc, path, inheritLower);
+    }
+
+    @Override
     public LsResult ls(RuntimeContext runtimeContext, String path) {
         return composite.ls(runtimeContext, path);
     }

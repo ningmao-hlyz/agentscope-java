@@ -153,6 +153,55 @@ public class RemoteFilesystem implements AbstractFilesystem {
         return store.supportsAtomicSessionStorage();
     }
 
+    @Override
+    public io.agentscope.harness.agent.filesystem.AtomicTextFile atomicTextFile(
+            RuntimeContext rc, String path, boolean inheritLower) {
+        if (!supportsAtomicUpdates()) {
+            throw new UnsupportedOperationException(
+                    "Workspace store does not support atomic updates");
+        }
+        List<String> namespace = List.copyOf(getNamespace(rc));
+        return new io.agentscope.harness.agent.filesystem.AtomicTextFile() {
+            private String content(StoreItem item) {
+                if (item == null) return null;
+                FileData data = convertItemToFileData(item);
+                if (data == null || data.content() == null || !"utf-8".equals(data.encoding())) {
+                    throw new IllegalStateException("Invalid UTF-8 file: " + path);
+                }
+                return data.content();
+            }
+
+            @Override
+            public String read() {
+                return content(store.get(namespace, path));
+            }
+
+            @Override
+            public boolean compareAndSet(String expected, String updated) {
+                java.util.Objects.requireNonNull(updated, "updated");
+                StoreItem item = store.get(namespace, path);
+                if (!java.util.Objects.equals(expected, content(item))) return false;
+                return store.putIfUnchanged(
+                        namespace,
+                        path,
+                        fileDataToStoreValue(
+                                item == null
+                                        ? FileData.create(updated)
+                                        : convertItemToFileData(item).withContent(updated)),
+                        item);
+            }
+
+            @Override
+            public boolean compareAndDelete(String expected) {
+                java.util.Objects.requireNonNull(expected, "expected");
+                StoreItem item = store.get(namespace, path);
+                return item != null
+                        && expected.equals(content(item))
+                        && store.deleteIfUnchanged(namespace, path, item);
+            }
+        };
+    }
+
     /**
      * Registers routing metadata for host-side task maintenance. The registry is a separate
      * store namespace, never a file visible to agent filesystem tools. Each resolved scope has

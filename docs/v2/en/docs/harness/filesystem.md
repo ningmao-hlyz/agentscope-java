@@ -580,3 +580,7 @@ Usually not needed — the three modes cover ~95% of use cases.
 - [Skills](/v2/en/docs/harness/skill) — four-layer composition, self-learning loop, the `<available_skills>` block
 - [Tools](/v2/en/docs/building-blocks/tool) — `read_file` / `write_file` / `execute` parameters
 - [Architecture](/v2/en/docs/harness/architecture) — how filesystem and runtime context cooperate
+
+## Conditional text writes
+
+`AbstractFilesystem.atomicTextFile(rc, path, inheritLower)` exposes UTF-8 reads, conditional replacement, and conditional deletion. Local files use an OS lock and atomic rename; remote stores must provide native conditional writes. Overlay implementations preserve their routing and copy-on-write behavior. Custom backends may leave this optional API unsupported; `WorkspaceManager.appendMemoryFileUtf8` then retains its legacy append behavior, without a cross-replica guarantee.

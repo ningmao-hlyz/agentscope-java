@@ -55,6 +55,12 @@ public final class BakedContextFilesystem implements AbstractFilesystem {
     }
 
     @Override
+    public AtomicTextFile atomicTextFile(
+            RuntimeContext runtimeContext, String path, boolean inheritLower) {
+        return delegate.atomicTextFile(bakedRc, path, inheritLower);
+    }
+
+    @Override
     public LsResult ls(RuntimeContext runtimeContext, String path) {
         return delegate.ls(bakedRc, path);
     }

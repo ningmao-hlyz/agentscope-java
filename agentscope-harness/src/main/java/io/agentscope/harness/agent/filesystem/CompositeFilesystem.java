@@ -64,6 +64,12 @@ import java.util.Map;
 public class CompositeFilesystem implements AbstractFilesystem {
 
     @Override
+    public AtomicTextFile atomicTextFile(RuntimeContext rc, String path, boolean inheritLower) {
+        RouteResult route = routeForPath(path);
+        return route.backend().atomicTextFile(rc, route.backendPath(), inheritLower);
+    }
+
+    @Override
     public io.agentscope.core.session.AtomicSessionStorage sessionStorage(RuntimeContext rc) {
         return routeForPath("agents/").backend().sessionStorage(rc);
     }

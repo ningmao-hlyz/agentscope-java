@@ -60,6 +60,36 @@ public class OverlayFilesystem implements AbstractFilesystem {
         return upper.sessionStorage(rc);
     }
 
+    @Override
+    public AtomicTextFile atomicTextFile(RuntimeContext rc, String path, boolean inheritLower) {
+        AtomicTextFile target = upper.atomicTextFile(rc, path, inheritLower);
+        if (!inheritLower) return target;
+        return new AtomicTextFile() {
+            private String inherited() {
+                return lower.exists(rc, path) ? lower.atomicTextFile(rc, path, true).read() : null;
+            }
+
+            @Override
+            public String read() {
+                String content = target.read();
+                return content == null ? inherited() : content;
+            }
+
+            @Override
+            public boolean compareAndSet(String expected, String updated) {
+                if (target.read() != null) return target.compareAndSet(expected, updated);
+                return java.util.Objects.equals(expected, inherited())
+                        && target.compareAndSet(null, updated);
+            }
+
+            @Override
+            public boolean compareAndDelete(String expected) {
+                // Deleting an upper file must not expose a shared ledger from the lower layer.
+                return inherited() == null && target.compareAndDelete(expected);
+            }
+        };
+    }
+
     private final AbstractFilesystem upper;
     private final AbstractFilesystem lower;
 

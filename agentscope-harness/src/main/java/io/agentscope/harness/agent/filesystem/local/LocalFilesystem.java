@@ -318,6 +318,7 @@ public class LocalFilesystem implements AbstractFilesystem {
         List<FileInfo> results = new ArrayList<>();
         try (DirectoryStream<Path> ds = Files.newDirectoryStream(dirPath)) {
             for (Path entry : ds) {
+                if (entry.getFileName().toString().endsWith(".cas-lock")) continue;
                 try {
                     BasicFileAttributes attrs =
                             Files.readAttributes(entry, BasicFileAttributes.class);
@@ -390,6 +391,12 @@ public class LocalFilesystem implements AbstractFilesystem {
         } catch (IOException e) {
             return ReadResult.fail("Error reading file '" + filePath + "': " + e.getMessage());
         }
+    }
+
+    @Override
+    public io.agentscope.harness.agent.filesystem.AtomicTextFile atomicTextFile(
+            RuntimeContext rc, String path, boolean inheritLower) {
+        return new LocalAtomicTextFile(resolvePath(rc, path));
     }
 
     @Override
@@ -523,6 +530,8 @@ public class LocalFilesystem implements AbstractFilesystem {
                     new SimpleFileVisitor<>() {
                         @Override
                         public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
+                            if (file.getFileName().toString().endsWith(".cas-lock"))
+                                return FileVisitResult.CONTINUE;
                             Path rel = searchPath.relativize(file);
                             if (matcher.matches(rel) || directMatcher.matches(rel)) {
                                 String filePath = resolveEntryPath(runtimeContext, file);
