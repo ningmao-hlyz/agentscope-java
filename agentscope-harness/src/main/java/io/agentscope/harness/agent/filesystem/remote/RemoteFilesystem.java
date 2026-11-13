@@ -711,7 +711,7 @@ public class RemoteFilesystem implements AbstractFilesystem {
         // Also check if any child exists (directory-like)
         List<StoreItem> items = searchAllItems(runtimeContext);
         for (StoreItem item : items) {
-            if (item.key().startsWith(normalized + "/")) {
+            if (item.key().equals(normalized) || item.key().startsWith(normalized + "/")) {
                 return true;
             }
         }
