@@ -31,6 +31,7 @@ import io.agentscope.core.model.GenerateOptions;
 import io.agentscope.core.model.Model;
 import io.agentscope.core.model.ToolSchema;
 import io.agentscope.harness.agent.context.ContextBudgetExceededException;
+import io.agentscope.harness.agent.filesystem.AtomicTextFile;
 import io.agentscope.harness.agent.filesystem.remote.RemoteFilesystem;
 import io.agentscope.harness.agent.filesystem.remote.store.InMemoryStore;
 import io.agentscope.harness.agent.filesystem.remote.store.StoreItem;
@@ -47,6 +48,8 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import reactor.core.Disposable;
 import reactor.core.publisher.Flux;
 
@@ -94,6 +97,30 @@ class MemoryConsolidatorCommitGateTest {
                 .content(List.of())
                 .finishReason(finishReason)
                 .build();
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"content_filter", "incomplete", "length"})
+    void incompleteSignalCannotCommitEvenWhenFollowedByStop(String reason) {
+        for (boolean followedByStop : List.of(false, true)) {
+            InMemoryStore store = new InMemoryStore();
+            List<String> ns = List.of("incomplete-merge");
+            seedFile(store, ns, "MEMORY.md", OLD_MEMORY);
+            seedDailyLedger(store, ns, "- fresh fact");
+            List<ChatResponse> chunks = new ArrayList<>();
+            chunks.add(textChunk("partial replacement"));
+            chunks.add(finishChunk(reason));
+            if (followedByStop) chunks.add(finishChunk("stop"));
+            ScriptedModel model = new ScriptedModel(List.of(Flux.fromIterable(chunks)));
+            try (WorkspaceManager manager =
+                    new WorkspaceManager(workspace, new RemoteFilesystem(store, ns))) {
+                RuntimeContext rc = RuntimeContext.empty();
+                new MemoryConsolidator(manager, model).consolidate(rc).block();
+                assertEquals(OLD_MEMORY, manager.atomicMemoryFile(rc, "MEMORY.md").read());
+                assertNull(
+                        manager.atomicMemoryFile(rc, MemoryConsolidator.PROGRESS_REL_PATH).read());
+            }
+        }
     }
 
     /** Model replaying one scripted response stream per call and recording every input. */
@@ -405,20 +432,16 @@ class MemoryConsolidatorCommitGateTest {
     }
 
     // ======================================================================
-    // The watermark advances only after the MEMORY.md write is confirmed.
-    // Here the host-side write fails silently (the target path is occupied
-    // by a directory, and the local writer swallows the IO error): without
-    // a read-back confirmation the watermark would advance past ledgers
-    // that never landed.
+    // An unreadable target must leave the ledger eligible for retry.
     // ======================================================================
 
     @Test
-    void unconfirmedWrite_doesNotAdvanceWatermark() throws Exception {
+    void unreadableMemory_doesNotAdvanceWatermark() throws Exception {
         Path memDir = workspace.resolve("memory");
         Files.createDirectories(memDir);
         String today = LocalDate.now().toString();
         Files.writeString(memDir.resolve(today + ".md"), "- fresh fact one\n");
-        // MEMORY.md cannot be written: a directory occupies its host-side path.
+        // A directory at MEMORY.md makes the consolidation snapshot unreadable.
         Files.createDirectory(workspace.resolve("MEMORY.md"));
 
         SandboxBackedFilesystem sandboxFs = new SandboxBackedFilesystem();
@@ -563,6 +586,112 @@ class MemoryConsolidatorCommitGateTest {
                     ((Number) watermark.value().get("ts")).longValue() > 0,
                     "the store watermark must carry the run timestamp");
             assertTrue(consolidator.readWatermark(rc).isAfter(Instant.EPOCH));
+        }
+    }
+
+    @Test
+    void concurrentMemorySaveWinsAndStaleConsolidationRetries() throws Exception {
+        InMemoryStore store = new InMemoryStore();
+        List<String> ns = List.of("gate-test");
+        RemoteFilesystem fs = new RemoteFilesystem(store, ns);
+        seedFile(store, ns, "MEMORY.md", OLD_MEMORY);
+        seedDailyLedger(store, ns, "- fresh fact one");
+
+        try (WorkspaceManager wsm = new WorkspaceManager(workspace, fs)) {
+            RuntimeContext rc = RuntimeContext.empty();
+            int[] calls = {0};
+            Model model =
+                    new Model() {
+                        @Override
+                        public Flux<ChatResponse> stream(
+                                List<Msg> messages,
+                                List<ToolSchema> tools,
+                                GenerateOptions options) {
+                            if (calls[0]++ == 0)
+                                wsm.appendMemoryFileUtf8(rc, "MEMORY.md", "\n- concurrent fact\n");
+                            String output =
+                                    calls[0] == 1
+                                            ? "# Curated\n- fresh fact one"
+                                            : "# Curated\n- fresh fact one\n- concurrent fact";
+                            return Flux.just(textChunk(output), finishChunk("stop"));
+                        }
+
+                        @Override
+                        public String getModelName() {
+                            return "concurrent-consolidation-model";
+                        }
+                    };
+            MemoryConsolidator consolidator = new MemoryConsolidator(wsm, model, 100);
+
+            consolidator.consolidate(rc).block();
+
+            assertEquals(OLD_MEMORY + "\n- concurrent fact\n", wsm.readMemoryMd(rc));
+            assertEquals(Instant.EPOCH, consolidator.readWatermark(rc));
+
+            consolidator.consolidate(rc).block();
+
+            assertEquals(2, calls[0]);
+            assertEquals("# Curated\n- fresh fact one\n- concurrent fact", wsm.readMemoryMd(rc));
+            assertTrue(consolidator.readWatermark(rc).isAfter(Instant.EPOCH));
+        }
+    }
+
+    @Test
+    void firstConsolidationCreatesMissingMemory() {
+        InMemoryStore store = new InMemoryStore();
+        List<String> ns = List.of("gate-test");
+        seedDailyLedger(store, ns, "- fresh fact one");
+        ScriptedModel model =
+                new ScriptedModel(
+                        List.of(Flux.just(textChunk("- fresh fact one"), finishChunk("stop"))));
+        try (WorkspaceManager manager =
+                new WorkspaceManager(workspace, new RemoteFilesystem(store, ns))) {
+            RuntimeContext rc = RuntimeContext.empty();
+            MemoryConsolidator consolidator = new MemoryConsolidator(manager, model, 20);
+
+            consolidator.consolidate(rc).block();
+
+            assertEquals("- fresh fact one", manager.readMemoryMd(rc));
+            assertTrue(consolidator.readWatermark(rc).isAfter(Instant.EPOCH));
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void storageFailureKeepsWatermarkForRetry(boolean failRead) {
+        InMemoryStore store = new InMemoryStore();
+        List<String> ns = List.of("gate-test");
+        seedFile(store, ns, "MEMORY.md", OLD_MEMORY);
+        seedDailyLedger(store, ns, "- fresh fact one");
+        ScriptedModel model =
+                new ScriptedModel(
+                        List.of(Flux.just(textChunk("- fresh fact one"), finishChunk("stop"))));
+        try (WorkspaceManager manager =
+                new WorkspaceManager(workspace, new RemoteFilesystem(store, ns)) {
+                    @Override
+                    public AtomicTextFile atomicMemoryFile(RuntimeContext rc, String path) {
+                        AtomicTextFile delegate = super.atomicMemoryFile(rc, path);
+                        return new AtomicTextFile() {
+                            public String read() {
+                                if (failRead && path.startsWith("memory/"))
+                                    throw new IllegalStateException("ledger unavailable");
+                                return delegate.read();
+                            }
+
+                            public boolean compareAndSet(String expected, String updated) {
+                                throw new IllegalStateException("storage unavailable");
+                            }
+                        };
+                    }
+                }) {
+            RuntimeContext rc = RuntimeContext.empty();
+            MemoryConsolidator consolidator = new MemoryConsolidator(manager, model, 20);
+
+            consolidator.consolidate(rc).block();
+
+            assertEquals(OLD_MEMORY, manager.readMemoryMd(rc));
+            assertEquals(Instant.EPOCH, consolidator.readWatermark(rc));
+            assertEquals(failRead ? 0 : 1, model.inputs.size());
         }
     }
 }

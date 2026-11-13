@@ -32,6 +32,8 @@ import io.agentscope.core.model.Model;
 import io.agentscope.core.model.ToolSchema;
 import io.agentscope.core.state.AgentState;
 import io.agentscope.harness.agent.memory.MemoryBackgroundTasks;
+import io.agentscope.harness.agent.workspace.WorkspaceManager;
+import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
@@ -40,6 +42,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 import reactor.core.publisher.Flux;
 
 /**
@@ -48,6 +51,8 @@ import reactor.core.publisher.Flux;
  * the caller — and that concurrent flushes for the same isolation key are serialised.
  */
 class MemoryFlushMiddlewareAsyncFlushTest {
+
+    @TempDir Path workspace;
 
     @Test
     void onCompleteFiresBeforeAsyncFlushCompletes() throws Exception {
@@ -88,7 +93,8 @@ class MemoryFlushMiddlewareAsyncFlushTest {
                         .build();
         AgentState state = AgentState.builder().addMessage(userMsg).build();
         RuntimeContext rc = RuntimeContext.builder().agentState(state).build();
-        MemoryFlushMiddleware middleware = new MemoryFlushMiddleware(null, gatedModel);
+        MemoryFlushMiddleware middleware =
+                new MemoryFlushMiddleware(new WorkspaceManager(workspace), gatedModel);
 
         AgentEndEvent event = new AgentEndEvent("reply-1");
         try {
@@ -165,7 +171,8 @@ class MemoryFlushMiddlewareAsyncFlushTest {
                 Msg.builder().role(MsgRole.USER).textContent("remember: deploy Fridays").build();
         AgentState state = AgentState.builder().addMessage(userMsg).build();
         RuntimeContext rc = RuntimeContext.builder().userId("alice").agentState(state).build();
-        MemoryFlushMiddleware middleware = new MemoryFlushMiddleware(null, gatedModel);
+        MemoryFlushMiddleware middleware =
+                new MemoryFlushMiddleware(new WorkspaceManager(workspace), gatedModel);
         AgentInput input = new AgentInput(List.of(userMsg));
         AgentEndEvent event = new AgentEndEvent("reply-1");
 
@@ -177,6 +184,8 @@ class MemoryFlushMiddlewareAsyncFlushTest {
                     .block(Duration.ofSeconds(2));
             assertTrue(started[0].await(5, TimeUnit.SECONDS), "first flush must run");
 
+            state.contextMutable()
+                    .add(Msg.builder().role(MsgRole.USER).textContent("new turn").build());
             // Turn 2 (same key): queued behind the still-running first flush.
             middleware
                     .onAgent(null, rc, input, in -> Flux.just(event))
@@ -224,7 +233,8 @@ class MemoryFlushMiddlewareAsyncFlushTest {
                         .sessionId("session1")
                         .agentState(state)
                         .build();
-        MemoryFlushMiddleware middleware = new MemoryFlushMiddleware(null, gatedModel);
+        MemoryFlushMiddleware middleware =
+                new MemoryFlushMiddleware(new WorkspaceManager(workspace), gatedModel);
         AgentInput input = new AgentInput(List.of(userMsg));
         AgentEndEvent event = new AgentEndEvent("reply-1");
 
@@ -236,6 +246,8 @@ class MemoryFlushMiddlewareAsyncFlushTest {
                     .block(Duration.ofSeconds(2));
             assertTrue(started[0].await(5, TimeUnit.SECONDS), "first flush must run");
 
+            state.contextMutable()
+                    .add(Msg.builder().role(MsgRole.USER).textContent("new turn").build());
             // Turns 2 and 3 (same session) queue behind the running flush and must coalesce to a
             // single pending task: each queued flush snapshots the conversation at execution
             // time, so the newest one covers everything its predecessors would have extracted.
@@ -297,7 +309,8 @@ class MemoryFlushMiddlewareAsyncFlushTest {
                         .sessionId("sessionB")
                         .agentState(AgentState.builder().addMessage(userMsg).build())
                         .build();
-        MemoryFlushMiddleware middleware = new MemoryFlushMiddleware(null, gatedModel);
+        MemoryFlushMiddleware middleware =
+                new MemoryFlushMiddleware(new WorkspaceManager(workspace), gatedModel);
         AgentInput input = new AgentInput(List.of(userMsg));
         AgentEndEvent event = new AgentEndEvent("reply-1");
 
@@ -309,6 +322,9 @@ class MemoryFlushMiddlewareAsyncFlushTest {
                     .block(Duration.ofSeconds(2));
             assertTrue(started[0].await(5, TimeUnit.SECONDS), "session A's first flush must run");
 
+            rcA.getAgentState()
+                    .contextMutable()
+                    .add(Msg.builder().role(MsgRole.USER).textContent("new A turn").build());
             // Sessions B and A queue behind it, and B's second turn coalesces onto B's pending
             // task — but session A's pending task must survive: a different conversation.
             middleware

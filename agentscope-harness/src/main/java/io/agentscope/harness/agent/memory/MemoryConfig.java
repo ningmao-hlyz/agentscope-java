@@ -15,8 +15,10 @@
  */
 package io.agentscope.harness.agent.memory;
 
+import io.agentscope.core.model.GenerateOptions;
 import io.agentscope.core.model.Model;
 import io.agentscope.core.model.ModelRegistry;
+import io.agentscope.harness.agent.context.ContextPolicy;
 import io.agentscope.harness.agent.memory.compaction.CompactionConfig;
 import java.time.Duration;
 import java.util.Objects;
@@ -25,29 +27,17 @@ import java.util.Objects;
  * Unified configuration for the long-term memory pipeline (flush + consolidation +
  * maintenance). Pair with {@link CompactionConfig} for the in-context summarization pipeline.
  *
- * <p>The harness has three LLM-driven memory operations, each with its own prompt and
- * triggering rules:
- *
- * <ol>
- *   <li><b>Flush</b> — extracts long-term memories from a conversation window into today's
- *       daily ledger ({@code memory/YYYY-MM-DD.md}). Prompt: {@link #flushPrompt()},
- *       defaults to {@link MemoryFlushManager#DEFAULT_FLUSH_PROMPT}. Trigger:
- *       {@link #flushTrigger()}.</li>
- *   <li><b>Consolidation</b> — periodically merges daily ledgers into the curated
- *       {@code MEMORY.md}. Prompt: {@link #consolidationPrompt()}, defaults to
- *       {@link MemoryConsolidator#DEFAULT_CONSOLIDATION_PROMPT}. Run cadence:
- *       {@link #consolidationMinGap()}.</li>
- *   <li><b>Compaction summary</b> — distills the conversation prefix into one summary
- *       message before reasoning. Prompt lives on {@link CompactionConfig#getSummaryPrompt()};
- *       configure via {@code .compaction(CompactionConfig...)} rather than here.</li>
- * </ol>
+ * <p>Three independent LLM operations:
+ * <ul>
+ *   <li>Flush extracts facts into daily ledgers; see {@link #flushPrompt()} and {@link #flushTrigger()}.</li>
+ *   <li>Consolidation merges ledgers into MEMORY.md; see {@link #consolidationPrompt()} and {@link #consolidationMinGap()}.</li>
+ *   <li>Compaction summarizes conversation history; see {@link CompactionConfig}.</li>
+ * </ul>
+ * Flush budgeting and optional admission apply to all extraction triggers.
  *
  * <p>Flush and consolidation use independent throttle windows. A throttled policy allows the
  * first eligible call immediately; its minimum gap applies only between subsequent runs and is
  * not an initial delay. {@link FlushTrigger#never()} disables only the per-call flush.
- *
- * <p>All fields have sensible defaults; {@link #defaults()} returns a config equivalent
- * to the harness's historical behavior so adopting this class is a no-op upgrade.
  */
 public final class MemoryConfig {
 
@@ -59,6 +49,9 @@ public final class MemoryConfig {
 
     /** Default retention before a daily ledger is archived. */
     public static final int DEFAULT_DAILY_FILE_RETENTION_DAYS = 90;
+
+    /** Total deadline for one flush, including extraction, admission and all source batches. */
+    public static final Duration DEFAULT_FLUSH_TIMEOUT = Duration.ofMinutes(2);
 
     /** Strategy for the per-call flush hook. See {@link FlushTrigger}. */
     public enum FlushMode {
@@ -151,6 +144,11 @@ public final class MemoryConfig {
     private final Duration consolidationMinGap;
     private final int dailyFileRetentionDays;
     private final FlushTrigger flushTrigger;
+    private final ContextPolicy flushContextPolicy;
+    private final ContextPolicy consolidationContextPolicy;
+    private final MemoryAdmission admission;
+    private final GenerateOptions flushOptions;
+    private final Duration flushTimeout;
 
     private MemoryConfig(Builder b) {
         this.model = b.model;
@@ -160,6 +158,11 @@ public final class MemoryConfig {
         this.consolidationMinGap = b.consolidationMinGap;
         this.dailyFileRetentionDays = b.dailyFileRetentionDays;
         this.flushTrigger = b.flushTrigger;
+        this.flushContextPolicy = b.flushContextPolicy;
+        this.consolidationContextPolicy = b.consolidationContextPolicy;
+        this.admission = b.admission;
+        this.flushOptions = b.flushOptions;
+        this.flushTimeout = b.flushTimeout;
     }
 
     /**
@@ -210,7 +213,31 @@ public final class MemoryConfig {
         return flushTrigger;
     }
 
-    /** Returns a config equivalent to the harness's historical defaults. */
+    /** Whole-request extraction budget, independent of compaction. */
+    public ContextPolicy flushContextPolicy() {
+        return flushContextPolicy;
+    }
+
+    /** Whole-request consolidation budget, independent of extraction and compaction. */
+    public ContextPolicy consolidationContextPolicy() {
+        return consolidationContextPolicy;
+    }
+
+    /** Optional candidate gate; {@code null} disables admission. */
+    public MemoryAdmission admission() {
+        return admission;
+    }
+
+    /** Extraction generation overrides, or {@code null} for defaults. */
+    public GenerateOptions flushOptions() {
+        return flushOptions;
+    }
+
+    public Duration flushTimeout() {
+        return flushTimeout;
+    }
+
+    /** Returns the default configuration, with semantic admission disabled. */
     public static MemoryConfig defaults() {
         return new Builder().build();
     }
@@ -228,6 +255,11 @@ public final class MemoryConfig {
         private Duration consolidationMinGap = DEFAULT_CONSOLIDATION_MIN_GAP;
         private int dailyFileRetentionDays = DEFAULT_DAILY_FILE_RETENTION_DAYS;
         private FlushTrigger flushTrigger = FlushTrigger.always();
+        private ContextPolicy flushContextPolicy = ContextPolicy.defaults();
+        private ContextPolicy consolidationContextPolicy = ContextPolicy.defaults();
+        private MemoryAdmission admission;
+        private GenerateOptions flushOptions;
+        private Duration flushTimeout = DEFAULT_FLUSH_TIMEOUT;
 
         /**
          * Sets a dedicated model for memory operations (flush + consolidation),
@@ -284,7 +316,7 @@ public final class MemoryConfig {
             return this;
         }
 
-        /** Token budget passed to the consolidation prompt. Must be positive. */
+        /** Consolidation token target; four times this value caps MEMORY.md writes in characters. */
         public Builder consolidationMaxTokens(int consolidationMaxTokens) {
             if (consolidationMaxTokens <= 0) {
                 throw new IllegalArgumentException(
@@ -326,6 +358,49 @@ public final class MemoryConfig {
                 throw new IllegalArgumentException("flushTrigger must not be null");
             }
             this.flushTrigger = flushTrigger;
+            return this;
+        }
+
+        /** Selection and final validation share this policy; its output reserve caps generation. */
+        public Builder flushContextPolicy(ContextPolicy policy) {
+            this.flushContextPolicy = Objects.requireNonNull(policy);
+            return this;
+        }
+
+        /** Selection and final validation share this consolidation policy. */
+        public Builder consolidationContextPolicy(ContextPolicy policy) {
+            this.consolidationContextPolicy = Objects.requireNonNull(policy);
+            return this;
+        }
+
+        /** Null disables semantic admission. The extension or application supplies the judge. */
+        public Builder admission(MemoryAdmission admission) {
+            this.admission = admission;
+            return this;
+        }
+
+        /** Total flush deadline; completed batches survive a timeout. Must be positive. */
+        public Builder flushTimeout(Duration timeout) {
+            if (timeout == null || timeout.isZero() || timeout.isNegative())
+                throw new IllegalArgumentException("flushTimeout must be positive");
+            this.flushTimeout = timeout;
+            return this;
+        }
+
+        /** Per-request generation options. Use the output parameter supported by the adapter. */
+        public Builder flushOptions(GenerateOptions options) {
+            if (options != null) {
+                if (options.getModelName() != null)
+                    throw new IllegalArgumentException(
+                            "Select the extraction model with MemoryConfig.model");
+                Integer tokens = options.getMaxTokens();
+                Integer completion = options.getMaxCompletionTokens();
+                if (tokens != null && completion != null)
+                    throw new IllegalArgumentException("Set only one flush output token limit");
+                if ((tokens != null && tokens <= 0) || (completion != null && completion <= 0))
+                    throw new IllegalArgumentException("Flush output token limit must be positive");
+            }
+            this.flushOptions = options;
             return this;
         }
 

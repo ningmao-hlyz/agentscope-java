@@ -28,11 +28,13 @@ import io.agentscope.core.message.ToolUseBlock;
 import io.agentscope.core.model.ChatResponse;
 import io.agentscope.core.model.FinishReasons;
 import io.agentscope.core.model.Model;
+import io.agentscope.core.session.SessionKey;
 import io.agentscope.core.session.SessionLogException;
 import io.agentscope.core.session.SessionRecorder;
 import io.agentscope.core.util.ExceptionUtils;
 import io.agentscope.core.util.JsonUtils;
 import io.agentscope.harness.agent.context.ContextModelCalls;
+import io.agentscope.harness.agent.memory.MemoryBackgroundTasks;
 import io.agentscope.harness.agent.memory.MemoryFlushManager;
 import io.agentscope.harness.agent.memory.compaction.CompactionConfig.TruncateArgsConfig;
 import io.agentscope.harness.agent.middleware.CompactionMiddleware;
@@ -50,6 +52,7 @@ import java.util.stream.Collectors;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Schedulers;
 
 /**
  * <h2>Algorithm</h2>
@@ -57,8 +60,8 @@ import reactor.core.publisher.Mono;
  *   <li><b>Check trigger</b> — token count or message count exceeds threshold</li>
  *   <li><b>Determine cutoff</b> — find the earliest index that keeps the tail within the
  *       "keep" budget; never split an ASSISTANT tool-call from its TOOL result(s)</li>
- *   <li><b>Memory flush</b> (optional) — extract long-term memories from the prefix via
- *       {@link MemoryFlushManager#flushMemories}</li>
+ *   <li><b>Memory flush</b> (optional) — schedule log extraction; legacy execution attempts
+ *       a best-effort prefix flush</li>
  *   <li><b>Summarize</b> — one LLM call to distill the prefix into a structured summary</li>
  *   <li><b>Rebuild</b> — return {@code [summaryUserMsg] + preservedTail}</li>
  * </ol>
@@ -144,7 +147,13 @@ public class ConversationCompactor {
         return Mono.usingWhen(
                 recorder.record(
                                 "compaction/start",
-                                Map.of("compactionId", id, "inputMessages", conversationMessages))
+                                Map.of(
+                                        "compactionId",
+                                        id,
+                                        "inputMessages",
+                                        conversationMessages,
+                                        "unrecordedMessages",
+                                        recorder.unrecordedMessages(conversationMessages)))
                         .thenReturn(new CompactionExecution(id)),
                 execution ->
                         compactCandidate(rc, conversationMessages, config, agentId, sessionId)
@@ -246,17 +255,65 @@ public class ConversationCompactor {
                                     new IllegalStateException(
                                             "empty compaction strategy publisher")))
                     .flatMap(
-                            candidate ->
-                                    candidate.isPresent()
-                                            ? Mono.just(candidate)
-                                            : compactStandard(
-                                                    rc,
-                                                    conversationMessages,
-                                                    config,
-                                                    agentId,
-                                                    sessionId));
+                            candidate -> {
+                                if (candidate.isEmpty()) {
+                                    return compactStandard(
+                                            rc, conversationMessages, config, agentId, sessionId);
+                                }
+                                if (config.isFlushBeforeCompact()
+                                        && !candidate.get().equals(conversationMessages)) {
+                                    return flushBeforeCompact(
+                                                    rc, conversationMessages, agentId, sessionId)
+                                            .thenReturn(candidate);
+                                }
+                                return Mono.just(candidate);
+                            });
         }
         return compactStandard(rc, conversationMessages, config, agentId, sessionId);
+    }
+
+    private Mono<Void> flushBeforeCompact(
+            RuntimeContext rc, List<Msg> messages, String agentId, String sessionId) {
+        var recorder = SessionRecorder.from(rc);
+        if (recorder != null) {
+            return Mono.deferContextual(
+                    view -> {
+                        MemoryBackgroundTasks.begin();
+                        Mono.defer(
+                                        () ->
+                                                flushManager.flushSessionMemories(
+                                                        rc,
+                                                        recorder.log(),
+                                                        recorder.log().sourceId() != null
+                                                                ? recorder.log().sourceId()
+                                                                : new SessionKey(
+                                                                                rc.getUserId(),
+                                                                                agentId,
+                                                                                sessionId)
+                                                                        .storagePath()))
+                                .subscribeOn(Schedulers.boundedElastic())
+                                .contextWrite(context -> context.putAll(view))
+                                .doFinally(signal -> MemoryBackgroundTasks.end())
+                                .subscribe(
+                                        null,
+                                        error ->
+                                                log.warn(
+                                                        "Memory extraction pending retry: {}",
+                                                        error.toString()));
+                        return Mono.empty();
+                    });
+        }
+        return Mono.defer(() -> flushManager.flushMemories(rc, filterSummaryMessages(messages)))
+                .onErrorResume(
+                        error -> {
+                            if (ExceptionUtils.containsInterruptedException(error)
+                                    || SessionLogException.causedBy(error))
+                                return Mono.error(error);
+                            log.warn(
+                                    "Pre-compaction memory extraction failed: {}",
+                                    error.toString());
+                            return Mono.empty();
+                        });
     }
 
     private Mono<Optional<List<Msg>>> compactStandard(
@@ -286,7 +343,8 @@ public class ConversationCompactor {
         // Keep prior summaries in the summarization input so each compaction builds on the
         // previous one, but exclude them from memory flushing to avoid duplicate extraction.
         List<Msg> summaryInput = new ArrayList<>(messages.subList(0, cutoff));
-        List<Msg> flushInput = filterSummaryMessages(summaryInput);
+        // Extract original source content, not tool-output/argument previews produced above.
+        List<Msg> flushInput = filterSummaryMessages(conversationMessages.subList(0, cutoff));
         List<Msg> tail = new ArrayList<>(messages.subList(cutoff, messages.size()));
 
         log.info(
@@ -296,23 +354,10 @@ public class ConversationCompactor {
                 cutoff,
                 tail.size());
 
-        // Step 2: Flush long-term memories only from newly compacted raw messages (best-effort).
+        // Durable history permits extraction to lag behind context compaction.
         Mono<Void> flushStep =
                 config.isFlushBeforeCompact()
-                        ? flushManager
-                                .flushMemories(rc, flushInput)
-                                .doOnSuccess(v -> log.debug("Memory flush before compaction done"))
-                                .onErrorResume(
-                                        e -> {
-                                            if ((ExceptionUtils.containsInterruptedException(e)
-                                                    || SessionLogException.causedBy(e))) {
-                                                return Mono.error(e);
-                                            }
-                                            log.warn(
-                                                    "Memory flush before compaction failed: {}",
-                                                    e.getMessage());
-                                            return Mono.empty();
-                                        })
+                        ? flushBeforeCompact(rc, flushInput, agentId, sessionId)
                         : Mono.empty();
 
         // Native logging already preserves all pre-compaction messages. Reference the logical

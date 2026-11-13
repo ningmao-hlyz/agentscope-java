@@ -19,6 +19,8 @@ import io.agentscope.core.agent.RuntimeContext;
 import io.agentscope.core.message.ToolResultBlock;
 import io.agentscope.core.tool.Tool;
 import io.agentscope.core.tool.ToolParam;
+import io.agentscope.harness.agent.filesystem.AtomicTextFile;
+import io.agentscope.harness.agent.memory.MemoryConfig;
 import io.agentscope.harness.agent.workspace.WorkspaceConstants;
 import io.agentscope.harness.agent.workspace.WorkspaceManager;
 import java.time.Instant;
@@ -26,24 +28,26 @@ import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
 
 /**
- * Dedicated tool for persisting user memories to both {@code MEMORY.md} and
- * today's daily ledger ({@code memory/YYYY-MM-DD.md}).
+ * Appends user memories to {@code MEMORY.md} and today's daily ledger.
  *
- * <p>This is the <b>only</b> sanctioned entry point for the agent to write long-term
- * memories. The system prompt directs the LLM to use this tool instead of
- * {@code write_file}/{@code edit_file} on memory paths, eliminating the
- * non-determinism of the LLM choosing arbitrary file names or skipping the
- * daily ledger.
- *
- * <p>Writes are append-only; deduplication and size-trimming are handled by the
- * periodic {@link io.agentscope.harness.agent.memory.MemoryConsolidator}.
+ * <p>Appends within the consolidation body limit. Semantic deduplication and trimming remain
+ * the responsibility of {@link io.agentscope.harness.agent.memory.MemoryConsolidator}.
  */
 public class MemorySaveTool {
 
     private final WorkspaceManager workspaceManager;
+    private final long maxMemoryChars;
 
     public MemorySaveTool(WorkspaceManager workspaceManager) {
+        this(workspaceManager, MemoryConfig.DEFAULT_CONSOLIDATION_MAX_TOKENS);
+    }
+
+    public MemorySaveTool(WorkspaceManager workspaceManager, int maxMemoryTokens) {
+        if (maxMemoryTokens <= 0) {
+            throw new IllegalArgumentException("maxMemoryTokens must be positive");
+        }
         this.workspaceManager = workspaceManager;
+        this.maxMemoryChars = (long) maxMemoryTokens * 4;
     }
 
     @Tool(
@@ -71,7 +75,30 @@ public class MemorySaveTool {
 
         String section = "\n" + content.strip() + "\n";
 
-        workspaceManager.appendMemoryFileUtf8(rc, WorkspaceConstants.MEMORY_MD, section);
+        AtomicTextFile memory = workspaceManager.atomicMemoryFile(rc, WorkspaceConstants.MEMORY_MD);
+        boolean saved = false;
+        for (int attempt = 0; attempt < 20; attempt++) {
+            String before = memory.read();
+            long size = (before == null ? 0L : before.length()) + section.length();
+            if (size > maxMemoryChars) {
+                return ToolResultBlock.error(
+                        "MEMORY.md would exceed its "
+                                + maxMemoryChars
+                                + "-character limit by "
+                                + (size - maxMemoryChars)
+                                + ". Nothing was saved. Save less content or retry after existing"
+                                + " memory is reduced; maintenance without new ledger entries"
+                                + " does not free space.");
+            }
+            if (memory.compareAndSet(before, (before == null ? "" : before) + section)) {
+                saved = true;
+                break;
+            }
+        }
+        if (!saved) {
+            return ToolResultBlock.error(
+                    "MEMORY.md changed repeatedly; nothing was saved. Retry later.");
+        }
 
         String today = LocalDate.now().format(DateTimeFormatter.ISO_LOCAL_DATE);
         String dailyPath = WorkspaceConstants.MEMORY_DIR + "/" + today + ".md";

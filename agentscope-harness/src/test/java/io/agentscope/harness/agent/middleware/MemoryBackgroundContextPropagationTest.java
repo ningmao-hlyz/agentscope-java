@@ -82,7 +82,8 @@ class MemoryBackgroundContextPropagationTest {
                         .sessionId("session-1")
                         .agentState(AgentState.builder().addMessage(userMsg).build())
                         .build();
-        MemoryFlushMiddleware middleware = new MemoryFlushMiddleware(null, capturingModel);
+        MemoryFlushMiddleware middleware =
+                new MemoryFlushMiddleware(new WorkspaceManager(workspace), capturingModel);
 
         middleware
                 .onAgent(

@@ -244,7 +244,7 @@ A summary replaces the conversation only when it is complete and actually smalle
 
 <span id="coordination-with-memory" />
 
-With `flushBeforeCompact(true)`, the compactor also attempts to extract useful facts into long-term memory before summarizing. This is best-effort extraction, not a guarantee that every detail survives. It is separate from native conversation history and from the current task projection. See [Memory](/v2/en/docs/harness/memory) for memory extraction and maintenance.
+With `flushBeforeCompact(true)`, native execution schedules background memory extraction from committed history. Compaction waits for the source log commit, not extraction; a later trigger can replay failed work. Legacy execution attempts a synchronous, best-effort prefix flush. See [Memory](/v2/en/docs/harness/memory) for recovery limits and configuration.
 
 <span id="what-compaction-does-not-touch" />
 

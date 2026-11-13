@@ -21,66 +21,47 @@ import io.agentscope.core.message.MsgRole;
 import io.agentscope.core.message.TextBlock;
 import io.agentscope.core.message.ToolResultBlock;
 import io.agentscope.core.message.ToolUseBlock;
+import io.agentscope.core.middleware.ModelCallInput;
 import io.agentscope.core.model.ChatResponse;
 import io.agentscope.core.model.FinishReasons;
+import io.agentscope.core.model.GenerateOptions;
 import io.agentscope.core.model.Model;
+import io.agentscope.core.util.JsonUtils;
+import io.agentscope.harness.agent.context.ContextBudgetExceededException;
 import io.agentscope.harness.agent.context.ContextModelCalls;
-import io.agentscope.harness.agent.filesystem.AbstractFilesystem;
+import io.agentscope.harness.agent.context.ContextPolicy;
+import io.agentscope.harness.agent.filesystem.AtomicTextFile;
 import io.agentscope.harness.agent.filesystem.model.FileInfo;
 import io.agentscope.harness.agent.filesystem.remote.store.BaseStore;
 import io.agentscope.harness.agent.filesystem.remote.store.StoreItem;
 import io.agentscope.harness.agent.workspace.WorkspaceManager;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.time.Instant;
-import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Schedulers;
 
 /**
- * LLM-based consolidation of daily memory ledgers into the curated {@code MEMORY.md}.
+ * Merges one budgeted ledger prefix per run, persisting file offsets for restart recovery.
+ * Storage follows {@link WorkspaceManager}'s memory routing; the legacy watermark is retained.
  *
- * <p>This component owns the second layer of the two-layer memory model:
- * <ul>
- *   <li><b>Layer 1 — daily ledger</b>: {@code memory/YYYY-MM-DD.md} files written by
- *       {@link MemoryFlushManager}, append-only, one section per compaction flush.</li>
- *   <li><b>Layer 2 — curated MEMORY.md</b>: Owned by this class. Periodically reads the
- *       daily ledgers (those modified since the last consolidation watermark) plus the
- *       current MEMORY.md, asks the LLM to merge / dedupe / trim, and overwrites
- *       MEMORY.md with the result.</li>
- * </ul>
+ * <p>The budget-only auxiliary call commits complete, non-empty, text-only output within the
+ * body target. CAS against the input snapshot protects concurrent saves; conflicts and storage
+ * errors leave progress unchanged for retry. Memory and progress are separate writes, so a
+ * crash after the memory write can replay a batch.
  *
- * <p>A small state file ({@code memory/.consolidation_state}) records the timestamp of
- * the last successful consolidation. Daily files whose {@code modifiedAt} is at or before
- * that timestamp are skipped — reducing token usage and protecting MEMORY.md from being
- * re-rewritten with stale content.
- *
- * <p>All file I/O is performed via the {@link AbstractFilesystem} obtained from the
- * {@link WorkspaceManager}, so this class is backend-agnostic (works with Local,
- * Sandbox, and Remote filesystems without any direct {@code java.nio.file.Files} usage).
- *
- * <p><b>Commit gate.</b> The LLM merge runs through the budget-only auxiliary call
- * boundary ({@link ContextModelCalls#auxiliary} — no parent history, tools, or task
- * projection, no recursive compaction). Its result replaces {@code MEMORY.md} and
- * advances the watermark only when it is a <em>complete</em> (not length-truncated),
- * text-only (no tool-call blocks), non-empty body within the configured body-text
- * target. Truncation, tool-call output, an empty or over-budget body, a model error,
- * a pre-commit cancellation, or a rejected auxiliary input leaves the existing
- * {@code MEMORY.md} and the watermark untouched. The watermark advances only after
- * the write is confirmed by reading the file back. An unconfirmed write leaves the
- * watermark unchanged so the next run retries on the same ledgers; the memory body
- * may already have been written.
- *
- * <p>{@code maxMemoryTokens} is that <em>body-text target</em>: it is stated in the
- * prompt (tokens and the approximate character equivalent) and enforced on the
- * committed body. It is deliberately <b>not</b> passed to the model API as an output
- * limit — a reasoning model's API limit must also cover its reasoning tokens, so
- * equating the two would either starve the body or pad the limit. The model's own
- * output limit keeps its provider default; should it cut the response short, the
- * truncation check above refuses to commit it.
+ * <p>{@code maxMemoryTokens} sets the prompt target and a four-characters-per-token body limit.
+ * The provider's output limit also covers reasoning tokens and remains independently configured;
+ * length-truncated output is rejected.
  */
 public class MemoryConsolidator {
 
@@ -124,15 +105,42 @@ public class MemoryConsolidator {
     private static final List<String> WATERMARK_NAMESPACE = List.of("memory", "consolidation");
     private static final String WATERMARK_KEY = "watermark";
     private static final int MAX_CAS_RETRIES = 5;
+    static final String PROGRESS_REL_PATH = "memory/.consolidation-progress.json";
+    private static final int MAX_BATCH_CHARS = 24_000;
+
+    private record FileProgress(int offset, String prefixHash) {
+        FileProgress {
+            if (offset < 0 || prefixHash == null)
+                throw new IllegalStateException("Invalid consolidation offset");
+        }
+    }
+
+    private record Progress(int version, String legacyWatermark, Map<String, FileProgress> files) {
+        Progress {
+            if (version != 1 || files == null)
+                throw new IllegalStateException("Invalid consolidation progress");
+            Instant.parse(legacyWatermark);
+            files = Map.copyOf(files);
+        }
+    }
+
+    private record Batch(List<Msg> input, Progress progress) {}
 
     private final WorkspaceManager workspaceManager;
     private final Model model;
     private final String consolidationPrompt;
     private final int maxMemoryTokens;
     private final BaseStore baseStore;
+    private final ContextPolicy policy;
+    private final GenerateOptions options;
 
     public MemoryConsolidator(WorkspaceManager workspaceManager, Model model) {
-        this(workspaceManager, model, DEFAULT_CONSOLIDATION_PROMPT, 4000, null);
+        this(
+                workspaceManager,
+                model,
+                DEFAULT_CONSOLIDATION_PROMPT,
+                MemoryConfig.DEFAULT_CONSOLIDATION_MAX_TOKENS,
+                null);
     }
 
     public MemoryConsolidator(WorkspaceManager workspaceManager, Model model, int maxMemoryTokens) {
@@ -153,8 +161,7 @@ public class MemoryConsolidator {
     }
 
     /**
-     * @param baseStore optional distributed store for the consolidation watermark; when set,
-     *     watermark reads prefer the store and writes use CAS with a filesystem fallback
+     * @param baseStore optional legacy watermark mirror; source progress stays in routed files
      */
     public MemoryConsolidator(
             WorkspaceManager workspaceManager,
@@ -162,83 +169,170 @@ public class MemoryConsolidator {
             String consolidationPrompt,
             int maxMemoryTokens,
             BaseStore baseStore) {
+        this(
+                workspaceManager,
+                model,
+                consolidationPrompt,
+                maxMemoryTokens,
+                baseStore,
+                ContextPolicy.defaults());
+    }
+
+    public MemoryConsolidator(
+            WorkspaceManager workspaceManager,
+            Model model,
+            String consolidationPrompt,
+            int maxMemoryTokens,
+            BaseStore baseStore,
+            ContextPolicy policy) {
         this.workspaceManager = workspaceManager;
         this.model = model;
         this.consolidationPrompt =
                 consolidationPrompt != null ? consolidationPrompt : DEFAULT_CONSOLIDATION_PROMPT;
         this.maxMemoryTokens = maxMemoryTokens;
         this.baseStore = baseStore;
+        this.policy = Objects.requireNonNull(policy);
+        this.options = model == null ? null : ContextModelCalls.outputOptions(model, policy, null);
     }
 
     /**
-     * Runs consolidation: reads daily files modified after the last watermark and the
-     * current MEMORY.md, uses the LLM to merge them, overwrites MEMORY.md, and
-     * advances the watermark on success.
-     *
-     * <p>If no daily files have been touched since the last run, this is a no-op.
+     * Merges one batch, advancing file offsets only after the memory CAS succeeds.
      */
     public Mono<Void> consolidate(RuntimeContext rc) {
-        Instant watermark = readWatermark(rc);
+        return Mono.defer(() -> consolidateBatch(rc))
+                .then()
+                .subscribeOn(Schedulers.boundedElastic());
+    }
+
+    /** Processes at most four successful batches per maintenance run. */
+    public Mono<Void> catchUp(RuntimeContext rc) {
+        return catchUp(rc, 4).subscribeOn(Schedulers.boundedElastic());
+    }
+
+    private Mono<Void> catchUp(RuntimeContext rc, int remaining) {
+        return Mono.defer(
+                () -> {
+                    AtomicTextFile progress =
+                            workspaceManager.atomicMemoryFile(rc, PROGRESS_REL_PATH);
+                    String before = progress.read();
+                    return consolidate(rc)
+                            .then(
+                                    Mono.defer(
+                                            () ->
+                                                    remaining > 1
+                                                                    && !Objects.equals(
+                                                                            before, progress.read())
+                                                            ? catchUp(rc, remaining - 1)
+                                                            : Mono.empty()));
+                });
+    }
+
+    /** Checks persisted coverage before maintenance archives a ledger snapshot. */
+    public boolean isConsolidated(RuntimeContext rc, FileInfo file) {
+        return consolidatedSnapshot(rc, file) != null;
+    }
+
+    /** Returns a fully consumed snapshot for conditional archival, or null without proof. */
+    public String consolidatedSnapshot(RuntimeContext rc, FileInfo file) {
+        try {
+            String snapshot = workspaceManager.atomicMemoryFile(rc, PROGRESS_REL_PATH).read();
+            if (snapshot == null) return null;
+            Progress progress = JsonUtils.getJsonCodec().fromJson(snapshot, Progress.class);
+            FileProgress position = progress.files().get(toRelative(file.path()));
+            if (position == null) return null;
+            String content = workspaceManager.atomicMemoryFile(rc, toRelative(file.path())).read();
+            return content != null
+                            && position.offset() == content.length()
+                            && hashPrefix(content, content.length()).equals(position.prefixHash())
+                    ? content
+                    : null;
+        } catch (RuntimeException e) {
+            log.warn(
+                    "Cannot confirm consolidation coverage for {}: {}",
+                    file.path(),
+                    e.getMessage());
+            return null;
+        }
+    }
+
+    private Mono<Boolean> consolidateBatch(RuntimeContext rc) {
         Instant runStart = Instant.now();
 
-        String currentMemory = workspaceManager.readMemoryMd(rc);
-        String dailyEntries = readDailyEntries(rc, watermark);
-
-        if (dailyEntries.isBlank()) {
-            log.debug("No fresh daily entries since {} — skipping consolidation", watermark);
+        AtomicTextFile memoryFile;
+        AtomicTextFile progressFile;
+        String progressSnapshot;
+        Progress progress;
+        String existingMemory;
+        try {
+            // Read progress before memory so a newer cursor never pairs with an older snapshot.
+            progressFile = workspaceManager.atomicMemoryFile(rc, PROGRESS_REL_PATH);
+            String snapshot = progressFile.read();
+            Progress previous =
+                    snapshot == null
+                            ? new Progress(1, readWatermarkFromFile(rc).toString(), Map.of())
+                            : JsonUtils.getJsonCodec().fromJson(snapshot, Progress.class);
+            if (previous == null) throw new IllegalStateException("Null consolidation progress");
+            progress = pruneArchivedProgress(rc, previous);
+            progressSnapshot =
+                    progress.equals(previous)
+                            ? snapshot
+                            : JsonUtils.getJsonCodec().toJson(progress);
+            if (!progress.equals(previous)
+                    && !progressFile.compareAndSet(snapshot, progressSnapshot)) {
+                log.debug("Consolidation progress changed during archive cleanup; retrying later");
+                return Mono.empty();
+            }
+            if (!progress.equals(previous)) {
+                log.debug(
+                        "Reclaimed {} archived ledger offsets",
+                        previous.files().size() - progress.files().size());
+            }
+            memoryFile = workspaceManager.atomicMemoryFile(rc, "MEMORY.md");
+            existingMemory = memoryFile.read();
+        } catch (RuntimeException e) {
+            log.warn("Failed to prepare consolidation state: {}", e.getMessage());
             return Mono.empty();
         }
-
-        int maxChars = maxMemoryTokens * 4;
+        long maxChars = (long) maxMemoryTokens * 4;
         String systemPrompt = String.format(consolidationPrompt, maxMemoryTokens, maxChars);
+        Batch batch;
+        try {
+            batch =
+                    prepareBatch(
+                            rc,
+                            progress,
+                            existingMemory == null ? "" : existingMemory,
+                            systemPrompt);
+        } catch (ContextBudgetExceededException e) {
+            return Mono.error(e);
+        } catch (RuntimeException e) {
+            log.warn("Failed to read consolidation ledgers: {}", e.getMessage());
+            return Mono.empty();
+        }
+        if (batch == null) return Mono.empty();
 
-        StringBuilder userContent = new StringBuilder();
-        userContent.append("Current MEMORY.md:\n");
-        userContent.append(currentMemory.isBlank() ? "(empty)" : currentMemory);
-        userContent
-                .append("\n\nNew daily ledger entries to merge")
-                .append(watermark == Instant.EPOCH ? "" : " (since " + watermark + ")")
-                .append(":\n");
-        userContent.append(dailyEntries);
-
-        List<Msg> messages = new ArrayList<>();
-        messages.add(
-                Msg.builder()
-                        .role(MsgRole.SYSTEM)
-                        .content(TextBlock.builder().text(systemPrompt).build())
-                        .build());
-        messages.add(
-                Msg.builder()
-                        .role(MsgRole.USER)
-                        .content(TextBlock.builder().text(userContent.toString()).build())
-                        .build());
-
-        // The merge call is an auxiliary request: it goes through the budget-only boundary
-        // (no parent history, tools, or task projection, no recursive compaction) and the
-        // existing session model-record entry — the same one the flush and compaction
-        // summary use.
-        return ContextModelCalls.auxiliary(model, messages)
+        return ContextModelCalls.auxiliary(model, batch.input(), policy, options)
                 .reduce(
                         new ConsolidationOutput(),
                         (acc, chatResponse) -> {
                             acc.accept(chatResponse);
                             return acc;
                         })
+                .publishOn(Schedulers.boundedElastic())
                 .flatMap(
                         acc -> {
                             String consolidated = acc.text().strip();
-                            if (FinishReasons.indicatesOutputLimit(
-                                    acc.finishReason(), acc.metadata())) {
+                            if (acc.incomplete()) {
                                 log.warn(
-                                        "Consolidation output truncated (finish reason {}) —"
-                                                + " keeping existing MEMORY.md and watermark",
+                                        "Consolidation output incomplete (finish reason {}) —"
+                                                + " keeping existing MEMORY.md and progress",
                                         acc.finishReason());
                                 return Mono.empty();
                             }
                             if (acc.sawToolBlock()) {
                                 log.warn(
                                         "Consolidation output contained tool-call blocks —"
-                                                + " keeping existing MEMORY.md and watermark");
+                                                + " keeping existing MEMORY.md and progress");
                                 return Mono.empty();
                             }
                             if (consolidated.isBlank()) {
@@ -249,22 +343,39 @@ public class MemoryConsolidator {
                                 log.warn(
                                         "Consolidation output of {} chars exceeds the {}-char body"
                                                 + " target — keeping existing MEMORY.md and"
-                                                + " watermark",
+                                                + " progress",
                                         consolidated.length(),
                                         maxChars);
                                 return Mono.empty();
                             }
-                            writeConsolidatedMemory(rc, consolidated);
-                            // Confirm the write before advancing: the memory-family writers
-                            // swallow IO failures, so an unconfirmed write (read-back
-                            // mismatch) must leave the watermark behind — the next run
-                            // retries the same ledgers. No cross-store transaction: the
-                            // memory write and the watermark remain two ordinary writes.
-                            String readBack = workspaceManager.readMemoryMd(rc);
-                            if (!consolidated.equals(readBack)) {
+                            boolean committed;
+                            try {
+                                committed = memoryFile.compareAndSet(existingMemory, consolidated);
+                            } catch (RuntimeException e) {
                                 log.warn(
-                                        "MEMORY.md write could not be confirmed — keeping"
-                                                + " watermark so the next run retries");
+                                        "Failed to write consolidated MEMORY.md: {}",
+                                        e.getMessage());
+                                return Mono.empty();
+                            }
+                            if (!committed) {
+                                log.warn(
+                                        "MEMORY.md changed during consolidation; keeping"
+                                                + " progress for retry");
+                                return Mono.empty();
+                            }
+                            try {
+                                if (!progressFile.compareAndSet(
+                                        progressSnapshot,
+                                        JsonUtils.getJsonCodec().toJson(batch.progress()))) {
+                                    log.warn(
+                                            "Consolidation progress changed; leaving it for retry");
+                                    return Mono.empty();
+                                }
+                            } catch (RuntimeException e) {
+                                log.warn(
+                                        "Failed to persist consolidation progress; batch may"
+                                                + " replay: {}",
+                                        e.getMessage());
                                 return Mono.empty();
                             }
                             writeWatermark(rc, runStart);
@@ -272,7 +383,7 @@ public class MemoryConsolidator {
                                     "MEMORY.md consolidated ({} chars), watermark advanced to {}",
                                     consolidated.length(),
                                     runStart);
-                            return Mono.empty();
+                            return Mono.just(true);
                         });
     }
 
@@ -283,6 +394,7 @@ public class MemoryConsolidator {
         private String finishReason;
         private final Map<String, Object> metadata = new HashMap<>();
         private boolean sawToolBlock;
+        private boolean incomplete;
 
         void accept(ChatResponse chunk) {
             if (chunk.getFinishReason() != null) {
@@ -291,6 +403,9 @@ public class MemoryConsolidator {
             if (chunk.getMetadata() != null && !chunk.getMetadata().isEmpty()) {
                 metadata.putAll(chunk.getMetadata());
             }
+            if (FinishReasons.indicatesOutputLimit(finishReason, metadata)
+                    || "incomplete".equalsIgnoreCase(finishReason)
+                    || "content_filter".equalsIgnoreCase(finishReason)) incomplete = true;
             if (chunk.getContent() != null) {
                 for (var block : chunk.getContent()) {
                     if (block instanceof TextBlock tb && tb.getText() != null) {
@@ -310,8 +425,8 @@ public class MemoryConsolidator {
             return finishReason;
         }
 
-        Map<String, Object> metadata() {
-            return metadata;
+        boolean incomplete() {
+            return incomplete;
         }
 
         boolean sawToolBlock() {
@@ -319,53 +434,154 @@ public class MemoryConsolidator {
         }
     }
 
-    /**
-     * Reads daily memory files modified strictly after the given watermark.
-     * If watermark is {@link Instant#EPOCH}, all daily files are returned (first run).
-     *
-     * <p>All I/O is done through the {@link AbstractFilesystem} so this works equally well
-     * with Local, Sandbox, and Store stores.
-     */
-    private String readDailyEntries(RuntimeContext rc, Instant watermark) {
-        AbstractFilesystem fs = workspaceManager.getFilesystem();
-        if (fs == null) {
-            return "";
-        }
-
-        // Listing delegates to the WorkspaceManager's single-home memory listing: under a
-        // sandbox-backed filesystem it enumerates the host-side authoritative copies (the
-        // sandbox glob would throw once the lease is released; routed configurations are
-        // resolved by the unified probe there, not a bare instanceof here).
-        List<FileInfo> matches = workspaceManager.listMemoryFileInfos(rc);
-        if (matches.isEmpty()) {
-            return "";
-        }
-
-        List<FileInfo> eligible = new ArrayList<>();
-        for (FileInfo fi : matches) {
-            if (fi.isDirectory()) {
-                continue;
-            }
-            String name = fileName(fi.path());
-            if (name.equals(STATE_FILE) || name.equals("archive") || !name.endsWith(".md")) {
-                continue;
-            }
-            if (isModifiedAfter(fi, watermark)) {
-                eligible.add(fi);
+    /** Reclaims completed archived offsets without changing the legacy cutoff. */
+    private Progress pruneArchivedProgress(RuntimeContext rc, Progress progress) {
+        Map<String, FileProgress> files = new HashMap<>(progress.files());
+        for (var entry : progress.files().entrySet()) {
+            String path = entry.getKey();
+            if (!path.matches("memory/\\d{4}-\\d{2}-\\d{2}\\.md")) continue;
+            String archive =
+                    workspaceManager
+                            .atomicMemoryFile(rc, "memory/archive/" + fileName(path))
+                            .read();
+            FileProgress position = entry.getValue();
+            if (archive != null
+                    && position.offset() == archive.length()
+                    && hashPrefix(archive, archive.length()).equals(position.prefixHash())
+                    && workspaceManager.atomicMemoryFile(rc, path).read() == null) {
+                files.remove(path);
             }
         }
-        eligible.sort(Comparator.comparing(fi -> fileName(fi.path())));
+        return new Progress(1, progress.legacyWatermark(), files);
+    }
 
-        StringBuilder sb = new StringBuilder();
+    /** Selects unconsumed file ranges within the complete request budget. */
+    private Batch prepareBatch(RuntimeContext rc, Progress progress, String memory, String prompt) {
+        Instant legacyWatermark = Instant.parse(progress.legacyWatermark());
+        List<FileInfo> eligible =
+                workspaceManager.listMemoryFileInfos(rc).stream()
+                        .filter(
+                                fi ->
+                                        !fi.isDirectory()
+                                                && toRelative(fi.path())
+                                                        .matches("memory/[^/]+\\.md"))
+                        .filter(
+                                fi ->
+                                        progress.files().containsKey(toRelative(fi.path()))
+                                                || isModifiedAfter(fi, legacyWatermark))
+                        .sorted(Comparator.comparing(fi -> fileName(fi.path())))
+                        .toList();
+        Map<String, FileProgress> files = new HashMap<>(progress.files());
+        StringBuilder selected = new StringBuilder();
         for (FileInfo fi : eligible) {
             String rel = toRelative(fi.path());
-            String content = workspaceManager.readMemoryFileUtf8(rc, rel);
-            if (content != null && !content.isBlank()) {
-                sb.append("### ").append(fileName(fi.path())).append("\n");
-                sb.append(content.strip()).append("\n\n");
+            String content = workspaceManager.atomicMemoryFile(rc, rel).read();
+            if (content == null || content.isBlank()) continue;
+            FileProgress previous = files.get(rel);
+            int start = 0;
+            if (previous != null) {
+                if (previous.offset() <= content.length()
+                        && hashPrefix(content, previous.offset()).equals(previous.prefixHash())) {
+                    start = previous.offset();
+                } else {
+                    log.warn(
+                            "Consolidation ledger {} changed before its offset; replaying it", rel);
+                }
             }
+            if (start == content.length()) continue;
+            String prefix = selected + "### " + fileName(fi.path()) + "\n";
+            int end = Math.min(content.length(), start + MAX_BATCH_CHARS - prefix.length() - 2);
+            if (end <= start) break;
+            if (end < content.length() && Character.isHighSurrogate(content.charAt(end - 1))) end--;
+            end = fittingEnd(prompt, memory, prefix, content, start, end);
+            if (end == start) {
+                if (!selected.isEmpty()) break;
+                List<Msg> input =
+                        consolidationInput(
+                                prompt,
+                                memory,
+                                prefix
+                                        + content.substring(
+                                                start, content.offsetByCodePoints(start, 1))
+                                        + "\n\n");
+                throw new ContextBudgetExceededException(cost(input), limit(input));
+            }
+            // Keep lines intact when possible; an oversized single line resumes by code point.
+            if (end < content.length()) {
+                int lineEnd = content.lastIndexOf('\n', end - 1) + 1;
+                if (lineEnd > start) end = lineEnd;
+            }
+            selected.append("### ")
+                    .append(fileName(fi.path()))
+                    .append('\n')
+                    .append(content, start, end)
+                    .append("\n\n");
+            files.put(rel, new FileProgress(end, hashPrefix(content, end)));
+            if (end < content.length()) break;
         }
-        return sb.toString();
+        if (selected.isEmpty()) return null;
+        List<Msg> input = consolidationInput(prompt, memory, selected.toString());
+        log.debug(
+                "Consolidation batch: ledgerChars={}, estimatedTokens={}, limit={}",
+                selected.length(),
+                cost(input),
+                limit(input));
+        return new Batch(input, new Progress(1, progress.legacyWatermark(), files));
+    }
+
+    private int fittingEnd(
+            String prompt, String memory, String prefix, String source, int start, int end) {
+        List<Msg> full =
+                consolidationInput(prompt, memory, prefix + source.substring(start, end) + "\n\n");
+        if (cost(full) <= limit(full)) return end;
+        int low = 0;
+        int high = source.codePointCount(start, end);
+        while (low < high) {
+            int middle = low + (high - low + 1) / 2;
+            int next = source.offsetByCodePoints(start, middle);
+            List<Msg> input =
+                    consolidationInput(
+                            prompt, memory, prefix + source.substring(start, next) + "\n\n");
+            if (cost(input) <= limit(input)) low = middle;
+            else high = middle - 1;
+        }
+        return source.offsetByCodePoints(start, low);
+    }
+
+    private List<Msg> consolidationInput(String prompt, String memory, String entries) {
+        return List.of(
+                Msg.builder().role(MsgRole.SYSTEM).name("system").textContent(prompt).build(),
+                Msg.builder()
+                        .role(MsgRole.USER)
+                        .textContent(
+                                "Current MEMORY.md:\n"
+                                        + (memory.isBlank() ? "(empty)" : memory)
+                                        + "\n\nNew daily ledger entries to merge:\n"
+                                        + entries)
+                        .build());
+    }
+
+    private long cost(List<Msg> input) {
+        return policy.estimator()
+                .estimate(new ModelCallInput(input, List.of(), options, model))
+                .tokens();
+    }
+
+    private long limit(List<Msg> input) {
+        return policy.budget(new ModelCallInput(input, List.of(), options, model)).inputTokens();
+    }
+
+    private static String hashPrefix(String content, int end) {
+        try {
+            return HexFormat.of()
+                    .formatHex(
+                            MessageDigest.getInstance("SHA-256")
+                                    .digest(
+                                            content.substring(0, end)
+                                                    .getBytes(StandardCharsets.UTF_8)));
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException(e);
+        }
     }
 
     private static boolean isModifiedAfter(FileInfo fi, Instant watermark) {
@@ -402,10 +618,6 @@ public class MemoryConsolidator {
         return path.startsWith("/") ? path.substring(1) : path;
     }
 
-    private void writeConsolidatedMemory(RuntimeContext rc, String content) {
-        workspaceManager.writeMemoryFileUtf8(rc, "MEMORY.md", content);
-    }
-
     static final String STATE_REL_PATH = "memory/" + STATE_FILE;
 
     /** Reads the last consolidation Instant, or {@link Instant#EPOCH} if none recorded. */
@@ -432,7 +644,7 @@ public class MemoryConsolidator {
 
     private Instant readWatermarkFromFile(RuntimeContext rc) {
         try {
-            String value = workspaceManager.readMemoryFileUtf8(rc, STATE_REL_PATH);
+            String value = workspaceManager.atomicMemoryFile(rc, STATE_REL_PATH).read();
             if (value == null || value.isBlank()) {
                 return Instant.EPOCH;
             }
@@ -451,7 +663,13 @@ public class MemoryConsolidator {
             writeWatermarkToStore(ts);
         }
         try {
-            workspaceManager.writeMemoryFileUtf8(rc, STATE_REL_PATH, ts.toString());
+            AtomicTextFile watermark = workspaceManager.atomicMemoryFile(rc, STATE_REL_PATH);
+            for (int attempt = 0; attempt < MAX_CAS_RETRIES; attempt++) {
+                String before = watermark.read();
+                if (before != null && !Instant.parse(before.strip()).isBefore(ts)) return;
+                if (watermark.compareAndSet(before, ts.toString())) return;
+            }
+            log.warn("Repeated consolidation watermark conflict; progress remains authoritative");
         } catch (Exception e) {
             log.warn(
                     "Failed to write consolidation watermark at {}: {}",

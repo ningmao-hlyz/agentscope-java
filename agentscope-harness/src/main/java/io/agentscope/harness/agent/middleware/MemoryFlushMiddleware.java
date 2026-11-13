@@ -19,7 +19,6 @@ import io.agentscope.core.ReActAgent;
 import io.agentscope.core.agent.Agent;
 import io.agentscope.core.agent.RuntimeContext;
 import io.agentscope.core.event.AgentEvent;
-import io.agentscope.core.message.Msg;
 import io.agentscope.core.middleware.AgentInput;
 import io.agentscope.core.model.Model;
 import io.agentscope.core.state.AgentState;
@@ -34,7 +33,6 @@ import java.util.ArrayList;
 import java.util.EnumSet;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
-import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Function;
@@ -54,8 +52,9 @@ import reactor.util.context.ContextView;
  * while the extraction runs on a background scheduler. The completing subscription's Reactor
  * context is replayed on that background subscription, so context-scoped instrumentation (token
  * metering, tracing) on the model call sees the same context as the turn. When
- * {@link CompactionMiddleware} is active, it handles memory extraction for the messages it
- * summarizes; this middleware covers the remaining tail of messages that were kept verbatim.
+ * native history is enabled, extraction reads committed session events through an independent
+ * cursor, including original messages removed from working context by compaction. Legacy
+ * execution can recover removed source only after its failed batch has been durably saved.
  *
  * <p>Flush is gated by a {@link MemoryConfig.FlushTrigger}:
  * <ul>
@@ -78,14 +77,7 @@ import reactor.util.context.ContextView;
  * <p>The class is thread-safe: instances hold only configuration, and the per-key queues live
  * in a static map and are synchronised internally.
  *
- * <p>The throttle window is tracked per <em>isolation key</em>, which matches the memory data
- * isolation in use:
- * <ul>
- *   <li>{@link IsolationScope#USER} (default) — one window per {@code userId}.</li>
- *   <li>{@link IsolationScope#SESSION} — one window per {@code sessionId}.</li>
- *   <li>{@link IsolationScope#AGENT} / {@link IsolationScope#GLOBAL} — one shared window for
- *       the whole agent instance (prevents concurrent flush races on shared memory files).</li>
- * </ul>
+ * <p>Throttle and queue keys include the workspace root and isolation identity.
  */
 public class MemoryFlushMiddleware implements HarnessRuntimeMiddleware {
 
@@ -93,7 +85,7 @@ public class MemoryFlushMiddleware implements HarnessRuntimeMiddleware {
 
     private final WorkspaceManager workspaceManager;
     private final Model model;
-    private final String flushPrompt;
+    private final MemoryConfig memoryConfig;
     private final MemoryConfig.FlushTrigger flushTrigger;
     private final IsolationScope isolationScope;
     private final PeriodicGate periodicGate;
@@ -144,12 +136,30 @@ public class MemoryFlushMiddleware implements HarnessRuntimeMiddleware {
             MemoryConfig.FlushTrigger flushTrigger,
             IsolationScope isolationScope,
             PeriodicGate periodicGate) {
+        this(
+                workspaceManager,
+                model,
+                MemoryConfig.builder()
+                        .flushPrompt(flushPrompt)
+                        .flushTrigger(
+                                flushTrigger != null
+                                        ? flushTrigger
+                                        : MemoryConfig.FlushTrigger.always())
+                        .build(),
+                isolationScope,
+                periodicGate);
+    }
+
+    public MemoryFlushMiddleware(
+            WorkspaceManager workspaceManager,
+            Model model,
+            MemoryConfig memoryConfig,
+            IsolationScope isolationScope,
+            PeriodicGate periodicGate) {
         this.workspaceManager = workspaceManager;
         this.model = model;
-        this.flushPrompt =
-                flushPrompt != null ? flushPrompt : MemoryFlushManager.DEFAULT_FLUSH_PROMPT;
-        this.flushTrigger =
-                flushTrigger != null ? flushTrigger : MemoryConfig.FlushTrigger.always();
+        this.memoryConfig = memoryConfig;
+        this.flushTrigger = memoryConfig.flushTrigger();
         this.isolationScope = isolationScope != null ? isolationScope : IsolationScope.USER;
         this.periodicGate = periodicGate != null ? periodicGate : new LocalPeriodicGate();
     }
@@ -270,17 +280,6 @@ public class MemoryFlushMiddleware implements HarnessRuntimeMiddleware {
             new ConcurrentHashMap<>();
 
     private Mono<Void> doFlush(Agent agent, RuntimeContext rc) {
-        AgentState state = RuntimeContext.resolveAgentState(rc, agent);
-        if (state == null) {
-            return Mono.empty();
-        }
-        // Read at execution time rather than scheduling time: a task that waited in the queue
-        // sees everything appended in the meantime, so coalescing queued tasks never loses
-        // messages.
-        List<Msg> messages = new ArrayList<>(state.getContext());
-        if (messages.isEmpty()) {
-            return Mono.empty();
-        }
         if (!shouldFlushNow(rc)) {
             log.debug("Memory flush skipped (trigger={})", flushTrigger);
             return Mono.empty();
@@ -293,10 +292,24 @@ public class MemoryFlushMiddleware implements HarnessRuntimeMiddleware {
             return Mono.empty();
         }
         MemoryFlushManager flushManager =
-                new MemoryFlushManager(workspaceManager, effective, flushPrompt);
-        return flushManager
-                .flushMemories(rc, messages)
-                .doOnSuccess(v -> log.debug("Memory flush completed"))
+                MemoryFlushManager.configured(workspaceManager, effective, memoryConfig);
+        Mono<Void> flush;
+        if (agent instanceof ReActAgent react && react.sessionLogEnabled()) {
+            var source = react.sessionLog(rc);
+            flush =
+                    flushManager.flushSessionMemories(
+                            rc,
+                            source,
+                            source.sourceId() != null
+                                    ? source.sourceId()
+                                    : react.sessionKey(rc).storagePath());
+        } else {
+            AgentState state = RuntimeContext.resolveAgentState(rc, agent);
+            if (state == null) return Mono.empty();
+            // Read on execution so a coalesced task includes all newly appended messages.
+            flush = flushManager.flushMemories(rc, new ArrayList<>(state.getContext()));
+        }
+        return flush.doOnSuccess(v -> log.debug("Memory flush completed"))
                 .onErrorResume(
                         e -> {
                             log.warn("Memory flush failed: {}", e.getMessage());
@@ -319,14 +332,11 @@ public class MemoryFlushMiddleware implements HarnessRuntimeMiddleware {
 
     /**
      * Returns whether this call should trigger a flush, applying the configured trigger policy.
-     * For {@link MemoryConfig.FlushMode#THROTTLED}, uses an {@link AtomicReference#compareAndSet}
-     * race to ensure at most one caller within {@code minGap} wins the slot.
+     * For {@link MemoryConfig.FlushMode#THROTTLED}, delegates the window claim to {@link PeriodicGate}.
      *
      * <p>The throttle window is keyed by the isolation dimension that matches the memory data
      * namespace (see {@link #timerKeyFor(RuntimeContext)}).
      *
-     * <p>Package-private for unit testing of the trigger gate without standing up a full
-     * {@code Agent}.
      */
     boolean shouldFlushNow(RuntimeContext rc) {
         switch (flushTrigger.mode()) {
@@ -342,13 +352,13 @@ public class MemoryFlushMiddleware implements HarnessRuntimeMiddleware {
     }
 
     /**
-     * Builds a composite key from {@link IsolationScope} name and the per-call identity returned
-     * by {@link #timerKeyFor(RuntimeContext)}. The operation prefix keeps flush independent
-     * of maintenance when both use the same {@link PeriodicGate}. The scope prefix keeps
-     * different isolation dimensions from sharing a slot.
+     * Separates workspaces and isolation identities; the operation prefix keeps flush independent
+     * of maintenance when sharing a gate.
      */
     private String compositeTimerKey(RuntimeContext rc) {
-        return "memory-flush:" + isolationScope.name() + ":" + timerKeyFor(rc);
+        var workspace = workspaceManager != null ? workspaceManager.getWorkspace() : null;
+        String root = workspace != null ? workspace.toAbsolutePath().normalize().toString() : "";
+        return "memory-flush:" + isolationScope.name() + ":" + root + ":" + timerKeyFor(rc);
     }
 
     /** The conversation a queued flush reads when it executes: agent instance, user, session. */

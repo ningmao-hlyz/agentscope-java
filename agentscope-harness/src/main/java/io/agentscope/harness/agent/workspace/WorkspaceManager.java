@@ -387,7 +387,15 @@ public class WorkspaceManager implements AutoCloseable {
         } else if (filesystem == null) {
             delegate = new LocalAtomicTextFile(workspace.resolve(normalized));
         } else {
-            delegate = filesystem.atomicTextFile(rc, normalized, true);
+            // Consumption metadata belongs to the writable namespace, not shared memory.
+            delegate =
+                    filesystem.atomicTextFile(
+                            rc,
+                            normalized,
+                            !normalized.startsWith(MEMORY_DIR + "/.flush-state/")
+                                    && !normalized.equals(
+                                            MEMORY_DIR + "/.consolidation-progress.json")
+                                    && !normalized.equals(MEMORY_DIR + "/.consolidation_state"));
         }
         return new AtomicTextFile() {
             @Override
@@ -1341,6 +1349,40 @@ public class WorkspaceManager implements AutoCloseable {
             }
         }
         return out;
+    }
+
+    /** Archives the current snapshot of a top-level daily ledger. */
+    public boolean archiveMemoryFile(RuntimeContext rc, String relativePath) {
+        try {
+            return archiveMemoryFile(rc, relativePath, atomicMemoryFile(rc, relativePath).read());
+        } catch (RuntimeException error) {
+            log.warn("Failed to read ledger for archival {}: {}", relativePath, error.getMessage());
+            return false;
+        }
+    }
+
+    /** Copies a snapshot before conditionally deleting its source; conflicting archives are kept. */
+    public boolean archiveMemoryFile(RuntimeContext rc, String relativePath, String expected) {
+        String source = requireSafeRelativePath(relativePath);
+        if (!source.startsWith(MEMORY_DIR + "/") || source.lastIndexOf('/') != MEMORY_DIR.length())
+            throw new IllegalArgumentException("Expected a top-level memory ledger");
+        String target = MEMORY_DIR + "/archive/" + source.substring(MEMORY_DIR.length() + 1);
+        try {
+            if (expected == null) return false;
+            AtomicTextFile ledger = atomicMemoryFile(rc, source);
+            if (!expected.equals(ledger.read())) return false;
+            AtomicTextFile archive = atomicMemoryFile(rc, target);
+            String existing = archive.read();
+            if (!expected.equals(existing)) {
+                if (existing != null && !expected.startsWith(existing)) return false;
+                if (!archive.compareAndSet(existing, expected) && !expected.equals(archive.read()))
+                    return false;
+            }
+            return ledger.compareAndDelete(expected);
+        } catch (RuntimeException error) {
+            log.warn("Failed to archive {}: {}", source, error.getMessage());
+            return false;
+        }
     }
 
     /**

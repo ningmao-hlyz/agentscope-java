@@ -241,7 +241,7 @@ public class CompactionConfig {
         return summaryPrompt;
     }
 
-    /** Whether to flush long-term memories from the prefix before compaction. */
+    /** Whether compaction triggers extraction; native logs allow it to run in the background. */
     public boolean isFlushBeforeCompact() {
         return flushBeforeCompact;
     }
@@ -276,12 +276,26 @@ public class CompactionConfig {
      * context window. Used by {@code CompactionMiddleware} to resolve dynamic defaults.
      */
     public CompactionConfig withEffective(int effectiveTriggerTokens, int effectiveKeepTokens) {
+        Builder b = copyBuilder();
+        b.triggerTokens = effectiveTriggerTokens;
+        b.keepTokens = effectiveKeepTokens;
+        return new CompactionConfig(b);
+    }
+
+    /** Preserves summary and retention settings while disabling memory extraction. */
+    public CompactionConfig withoutMemoryFlush() {
+        Builder b = copyBuilder();
+        b.flushBeforeCompact = false;
+        return new CompactionConfig(b);
+    }
+
+    private Builder copyBuilder() {
         Builder b = new Builder();
         b.triggerMessages = this.triggerMessages;
-        b.triggerTokens = effectiveTriggerTokens;
+        b.triggerTokens = this.triggerTokens;
         b.reserved = this.reserved;
         b.keepMessages = this.keepMessages;
-        b.keepTokens = effectiveKeepTokens;
+        b.keepTokens = this.keepTokens;
         b.keepTokensMin = this.keepTokensMin;
         b.keepTokensMax = this.keepTokensMax;
         b.keepTokensRatio = this.keepTokensRatio;
@@ -291,7 +305,7 @@ public class CompactionConfig {
         b.pruneConfig = this.pruneConfig;
         b.model = this.model;
         b.strategy = this.strategy;
-        return new CompactionConfig(b);
+        return b;
     }
 
     public static Builder builder() {
@@ -382,7 +396,7 @@ public class CompactionConfig {
             return this;
         }
 
-        /** Whether to flush long-term memories before compaction (default true). */
+        /** Trigger extraction on compaction (default true); best-effort in legacy execution. */
         public Builder flushBeforeCompact(boolean flushBeforeCompact) {
             this.flushBeforeCompact = flushBeforeCompact;
             return this;

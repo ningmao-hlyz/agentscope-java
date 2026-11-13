@@ -24,10 +24,13 @@ import io.agentscope.harness.agent.IsolationScope;
 import io.agentscope.harness.agent.coordination.LocalPeriodicGate;
 import io.agentscope.harness.agent.memory.MemoryConfig;
 import io.agentscope.harness.agent.memory.MemoryFlushManager;
+import io.agentscope.harness.agent.workspace.WorkspaceManager;
+import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 /**
  * Focused unit test for {@link MemoryFlushMiddleware#shouldFlushNow} — the trigger gate
@@ -35,6 +38,21 @@ import org.junit.jupiter.api.Test;
  * up a full {@code ReActAgent} pipeline.
  */
 class MemoryFlushMiddlewareTriggerTest {
+    @TempDir Path workspace;
+
+    @Test
+    void throttledMode_independentWorkspacesHaveIndependentWindows() {
+        var trigger = MemoryConfig.FlushTrigger.throttled(Duration.ofHours(1));
+        try (WorkspaceManager first = new WorkspaceManager(workspace.resolve("first"));
+                WorkspaceManager second = new WorkspaceManager(workspace.resolve("second"))) {
+            var a = new MemoryFlushMiddleware(first, null, null, trigger);
+            var b = new MemoryFlushMiddleware(second, null, null, trigger);
+            var rebuilt = new MemoryFlushMiddleware(first, null, null, trigger);
+            assertTrue(a.shouldFlushNow(RC_USER_A));
+            assertTrue(b.shouldFlushNow(RC_USER_A));
+            assertFalse(rebuilt.shouldFlushNow(RC_USER_A));
+        }
+    }
 
     private static final RuntimeContext RC_ANON = RuntimeContext.empty();
     private static final RuntimeContext RC_USER_A =

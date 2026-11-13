@@ -20,6 +20,7 @@ import io.agentscope.core.message.Msg;
 import io.agentscope.core.middleware.ModelCallInput;
 import io.agentscope.core.middleware.ModelRequestPreparer;
 import io.agentscope.core.model.ChatResponse;
+import io.agentscope.core.model.GenerateOptions;
 import io.agentscope.core.model.Model;
 import java.util.List;
 import java.util.UUID;
@@ -29,14 +30,55 @@ import reactor.core.publisher.Flux;
 public final class ContextModelCalls {
     private ContextModelCalls() {}
 
+    /** Resolves finite auxiliary output limits without copying provider credentials. */
+    public static GenerateOptions outputOptions(
+            Model model, ContextPolicy policy, GenerateOptions overrides) {
+        GenerateOptions configured = model.getDefaultGenerateOptions();
+        Integer tokens = configured == null ? null : configured.getMaxTokens();
+        Integer completion = configured == null ? null : configured.getMaxCompletionTokens();
+        if (tokens != null && tokens <= 0) tokens = null;
+        if (completion != null && completion <= 0) completion = null;
+        if (tokens == null && completion == null)
+            tokens =
+                    policy.budget(new ModelCallInput(List.of(), List.of(), null, model))
+                            .outputTokens();
+        GenerateOptions defaults =
+                GenerateOptions.builder().maxTokens(tokens).maxCompletionTokens(completion).build();
+        boolean explicit =
+                overrides != null
+                        && (overrides.getMaxTokens() != null
+                                || overrides.getMaxCompletionTokens() != null);
+        if (!explicit
+                && model.getContextWindowSize() > 0
+                && Math.max(tokens == null ? 0 : tokens, completion == null ? 0 : completion)
+                        > model.getContextWindowSize() / 2) {
+            int capped = Math.max(1, model.getContextWindowSize() / 2);
+            defaults =
+                    completion != null
+                            ? GenerateOptions.builder().maxCompletionTokens(capped).build()
+                            : GenerateOptions.builder().maxTokens(capped).build();
+        }
+        GenerateOptions resolved = GenerateOptions.mergeOptions(overrides, defaults);
+        if (policy.budget(new ModelCallInput(List.of(), List.of(), resolved, model)).inputTokens()
+                == 0)
+            throw new IllegalArgumentException(
+                    "Auxiliary output and safety reservations leave no input budget");
+        return resolved;
+    }
+
     public static Flux<ChatResponse> auxiliary(Model model, List<Msg> messages) {
+        return auxiliary(model, messages, ContextPolicy.defaults(), null);
+    }
+
+    public static Flux<ChatResponse> auxiliary(
+            Model model, List<Msg> messages, ContextPolicy policy, GenerateOptions options) {
         return Flux.deferContextual(
                 subscriber ->
-                        new HarnessContextBuilder(ContextPolicy.defaults(), null, null)
+                        new HarnessContextBuilder(policy, null, null)
                                 .prepare(
                                         null,
                                         RuntimeContext.empty(),
-                                        new ModelCallInput(messages, List.of(), null, model),
+                                        new ModelCallInput(messages, List.of(), options, model),
                                         UUID.randomUUID().toString(),
                                         ModelRequestPreparer.Purpose.SUMMARY)
                                 .flatMapMany(

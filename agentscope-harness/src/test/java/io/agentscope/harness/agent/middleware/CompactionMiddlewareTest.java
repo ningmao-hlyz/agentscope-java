@@ -36,6 +36,7 @@ import io.agentscope.core.model.ChatResponse;
 import io.agentscope.core.model.GenerateOptions;
 import io.agentscope.core.model.ToolSchema;
 import io.agentscope.core.session.InMemorySessionLogStore;
+import io.agentscope.core.session.SessionKey;
 import io.agentscope.core.state.AgentState;
 import io.agentscope.core.util.JsonUtils;
 import io.agentscope.harness.agent.memory.compaction.CompactionConfig;
@@ -590,8 +591,7 @@ class CompactionMiddlewareTest {
                                         .build());
                     }
                 };
-        ReActAgent agent = mock(ReActAgent.class);
-        when(agent.getName()).thenReturn("compaction-test-agent");
+        ReActAgent agent = agent();
         when(agent.getModel(any(RuntimeContext.class))).thenReturn(perCall);
         when(agent.getModel()).thenReturn(defaultModel);
         // No dedicated compaction model: the field is null, so compaction resolves the
@@ -648,6 +648,15 @@ class CompactionMiddlewareTest {
     private ReActAgent agent() {
         ReActAgent agent = mock(ReActAgent.class);
         when(agent.getName()).thenReturn("compaction-test-agent");
+        when(agent.sessionKey(any(RuntimeContext.class)))
+                .thenAnswer(
+                        invocation -> {
+                            RuntimeContext rc = invocation.getArgument(0);
+                            return new SessionKey(
+                                    rc.getUserId(),
+                                    "compaction-test-agent",
+                                    rc.getSessionId() == null ? "default" : rc.getSessionId());
+                        });
         return agent;
     }
 

@@ -33,6 +33,7 @@ import io.agentscope.core.state.AgentState;
 import io.agentscope.core.util.ExceptionUtils;
 import io.agentscope.core.util.JsonException;
 import io.agentscope.core.util.JsonUtils;
+import io.agentscope.harness.agent.memory.MemoryConfig;
 import io.agentscope.harness.agent.memory.MemoryFlushManager;
 import io.agentscope.harness.agent.memory.compaction.CompactionConfig;
 import io.agentscope.harness.agent.memory.compaction.ConversationCompactor;
@@ -87,12 +88,23 @@ public class CompactionMiddleware implements HarnessRuntimeMiddleware {
     private final WorkspaceManager workspaceManager;
     private final Model model;
     private final CompactionConfig config;
+    private final MemoryConfig memoryConfig;
 
     public CompactionMiddleware(
             WorkspaceManager workspaceManager, Model model, CompactionConfig config) {
+        this(workspaceManager, model, config, null);
+    }
+
+    /** Uses memory extraction configuration independently of the summary configuration. */
+    public CompactionMiddleware(
+            WorkspaceManager workspaceManager,
+            Model model,
+            CompactionConfig config,
+            MemoryConfig memoryConfig) {
         this.workspaceManager = workspaceManager;
         this.model = model;
         this.config = config;
+        this.memoryConfig = memoryConfig;
     }
 
     /** Narrow declaration: subclasses overriding more hooks must extend this set. */
@@ -201,7 +213,8 @@ public class CompactionMiddleware implements HarnessRuntimeMiddleware {
                                                             .keepTokens(0)
                                                             .flushBeforeCompact(
                                                                     config.isFlushBeforeCompact())
-                                                            .build());
+                                                            .build(),
+                                                    memoryConfig);
                                     return forced.prepareCandidate(
                                                     agent,
                                                     ctx,
@@ -350,10 +363,22 @@ public class CompactionMiddleware implements HarnessRuntimeMiddleware {
                     if (compactModel == null) {
                         compactModel = input.model();
                     }
+                    Model flushModel = memoryConfig == null ? compactModel : memoryConfig.model();
+                    if (flushModel == null) {
+                        flushModel =
+                                agent instanceof ReActAgent react
+                                        ? react.getModel(rc)
+                                        : input.model();
+                    }
                     ConversationCompactor compactor =
                             new ConversationCompactor(
                                     compactModel,
-                                    new MemoryFlushManager(workspaceManager, compactModel),
+                                    MemoryFlushManager.configured(
+                                            workspaceManager,
+                                            flushModel,
+                                            memoryConfig == null
+                                                    ? MemoryConfig.defaults()
+                                                    : memoryConfig),
                                     tokenCounter,
                                     toolResultTokenCounter);
                     // Copies may retain message IDs. Only an unchanged view can become durable;
@@ -364,7 +389,9 @@ public class CompactionMiddleware implements HarnessRuntimeMiddleware {
                                     rc,
                                     conversation,
                                     effective,
-                                    agent.getName(),
+                                    agent instanceof ReActAgent react
+                                            ? react.sessionKey(rc).agentId()
+                                            : agent.getName(),
                                     rc.getSessionId() == null ? "default" : rc.getSessionId())
                             .onErrorResume(
                                     error -> {

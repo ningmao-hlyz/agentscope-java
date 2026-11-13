@@ -36,7 +36,9 @@ import java.time.format.DateTimeFormatter;
  *   <li><b>Conversation compaction</b> — {@code CompactionConfig} with low thresholds
  *       ({@code triggerMessages=6, keepMessages=2}) so compaction fires after a few turns.</li>
  *   <li><b>Long-term memory flush</b> — {@code MemoryConfig} with {@code flushTrigger=ALWAYS}
- *       so facts are extracted to {@code memory/YYYY-MM-DD.md} after each call.</li>
+ *       so each call schedules extraction from the durable log into {@code memory/YYYY-MM-DD.md}.
+ *       The extraction cursor and receipts survive recreation with the same storage and identity;
+ *       compaction does not wait for extraction.</li>
  *   <li><b>Observable state changes</b> — prints context size before and after compaction
  *       to show the summarization effect.</li>
  * </ol>
@@ -67,13 +69,7 @@ public class MemoryCompactionExample {
                                 CompactionConfig.builder()
                                         .triggerMessages(6)
                                         .keepMessages(2)
-                                        // keepTokens defaults to dynamic mode (-1), which the
-                                        // middleware resolves from the model context window to a
-                                        // large token budget (e.g. ~8k) that always exceeds this
-                                        // short demo conversation — so the message-count keep
-                                        // window (keepMessages) is never used and compaction never
-                                        // fires. Set keepTokens(0) to force message-count keep mode
-                                        // so compaction actually triggers after a few turns.
+                                        // Use message-count retention for this short demo.
                                         .keepTokens(0)
                                         .build())
                         .memory(

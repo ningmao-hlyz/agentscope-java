@@ -21,6 +21,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 import io.agentscope.core.agent.RuntimeContext;
@@ -35,16 +38,24 @@ import io.agentscope.core.model.Model;
 import io.agentscope.core.model.ToolSchema;
 import io.agentscope.core.session.InMemorySessionLogStore;
 import io.agentscope.core.session.SessionKey;
+import io.agentscope.core.session.SessionLogException;
 import io.agentscope.core.session.SessionRecorder;
+import io.agentscope.harness.agent.memory.MemoryBackgroundTasks;
 import io.agentscope.harness.agent.memory.MemoryFlushManager;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
+import reactor.core.publisher.Sinks;
 import reactor.test.StepVerifier;
 
 /** Tests message routing between summarization, memory flushing, and the preserved tail. */
@@ -241,7 +252,7 @@ class ConversationCompactorTest {
                         .compactIfNeeded(
                                 mock(RuntimeContext.class),
                                 compactableMessages(),
-                                config(true),
+                                config(false),
                                 "agent",
                                 "s")
                         .block();
@@ -279,7 +290,7 @@ class ConversationCompactorTest {
                             .compactIfNeeded(
                                     mock(RuntimeContext.class),
                                     compactableMessages(),
-                                    config(true),
+                                    config(false),
                                     "agent",
                                     "s")
                             .block()
@@ -328,7 +339,7 @@ class ConversationCompactorTest {
                         .compactIfNeeded(
                                 mock(RuntimeContext.class),
                                 compactableMessages(),
-                                config(true),
+                                config(false),
                                 "agent",
                                 "s")
                         .block();
@@ -348,7 +359,7 @@ class ConversationCompactorTest {
                         .compactIfNeeded(
                                 mock(RuntimeContext.class),
                                 compactableMessages(),
-                                config(true),
+                                config(false),
                                 "agent",
                                 "s")
                         .block();
@@ -367,7 +378,7 @@ class ConversationCompactorTest {
         List<Msg> compacted =
                 compactor
                         .compactIfNeeded(
-                                mock(RuntimeContext.class), input, config(true), "agent", "s")
+                                mock(RuntimeContext.class), input, config(false), "agent", "s")
                         .block()
                         .orElseThrow();
 
@@ -441,7 +452,7 @@ class ConversationCompactorTest {
                         .compactIfNeeded(
                                 mock(RuntimeContext.class),
                                 compactableMessages(),
-                                config(true),
+                                config(false),
                                 "agent",
                                 "s")
                         .block();
@@ -495,6 +506,208 @@ class ConversationCompactorTest {
                                 "session-id"))
                 .expectError(InterruptedException.class)
                 .verify();
+    }
+
+    /** Extraction receives raw source even when the summary receives a pruned tool result. */
+    @Test
+    void compactIfNeeded_flushReceivesOriginalPrefixBeforeToolPruning() {
+        Fixture fixture = new Fixture();
+        String raw = "x".repeat(100_000) + "last-raw-sentinel";
+        List<Msg> input = List.of(padded("M1"), toolResult("bash", raw), message("TAIL"));
+        CompactionConfig config =
+                CompactionConfig.builder()
+                        .triggerTokens(1)
+                        .keepMessages(1)
+                        .keepTokens(0)
+                        .truncateArgs(null)
+                        .prune(
+                                CompactionConfig.PruneConfig.builder()
+                                        .protectTokens(0)
+                                        .minimumTokens(1)
+                                        .maxOutputChars(10)
+                                        .excludedTools(Set.of())
+                                        .build())
+                        .build();
+
+        fixture.compactor
+                .compactIfNeeded(fixture.runtimeContext, input, config, "agent", "s")
+                .block()
+                .orElseThrow();
+
+        Msg flushedTool = fixture.flushInputs.get(0).get(1);
+        ToolResultBlock result = (ToolResultBlock) flushedTool.getContent().get(0);
+        assertEquals(raw, ((TextBlock) result.getOutput().get(0)).getText());
+        assertFalse(fixture.model.prompt(0).contains("last-raw-sentinel"));
+    }
+
+    /** Legacy extraction remains best-effort; it cannot guarantee source recovery. */
+    @Test
+    void compactIfNeeded_legacyMemoryFailureDoesNotBlockSummary() {
+        RecordingModel model = new RecordingModel();
+        MemoryFlushManager flushManager = mock(MemoryFlushManager.class);
+        when(flushManager.flushMemories(any(RuntimeContext.class), anyList()))
+                .thenReturn(Mono.error(new IllegalStateException("memory store unavailable")));
+        List<Msg> input = new ArrayList<>(compactableMessages());
+        List<Msg> before = List.copyOf(input);
+
+        List<Msg> compacted =
+                new ConversationCompactor(model, flushManager)
+                        .compactIfNeeded(
+                                mock(RuntimeContext.class), input, config(true), "agent", "s")
+                        .block()
+                        .orElseThrow();
+
+        assertEquals(before, input);
+        assertEquals(1, model.inputs.size());
+        assertEquals(ConversationCompactor.SUMMARY_MSG_NAME, compacted.get(0).getName());
+    }
+
+    @Test
+    void customStrategyKeepsResultWhenLegacyMemoryFlushFails() {
+        List<Msg> original = compactableMessages();
+        MemoryFlushManager flushManager = mock(MemoryFlushManager.class);
+        when(flushManager.flushMemories(any(RuntimeContext.class), anyList()))
+                .thenReturn(Mono.error(new IllegalStateException("flush unavailable")));
+        CompactionConfig config =
+                CompactionConfig.builder()
+                        .triggerMessages(3)
+                        .triggerTokens(0)
+                        .strategy(
+                                request ->
+                                        Mono.just(Optional.of(List.of(request.messages().get(3)))))
+                        .build();
+
+        List<Msg> compacted =
+                new ConversationCompactor(new RecordingModel(), flushManager)
+                        .compactIfNeeded(mock(RuntimeContext.class), original, config, "agent", "s")
+                        .block()
+                        .orElseThrow();
+        assertEquals(List.of(original.get(3)), compacted);
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void durableMemoryFailureDoesNotBlockStandardOrCustomCompaction(boolean custom)
+            throws Exception {
+        RuntimeContext rc = RuntimeContext.builder().userId("user").sessionId("session").build();
+        var log =
+                new InMemorySessionLogStore().open(new SessionKey("user", "agent", "session"), rc);
+        SessionRecorder recorder = new SessionRecorder(log, "turn");
+        rc.put(SessionRecorder.CONTEXT_KEY, recorder);
+        MemoryFlushManager flush = mock(MemoryFlushManager.class);
+        when(flush.flushSessionMemories(rc, log, log.sourceId()))
+                .thenReturn(
+                        Mono.error(new IllegalStateException("memory permanently unavailable")));
+        CompactionConfig settings =
+                custom
+                        ? CompactionConfig.builder()
+                                .triggerMessages(3)
+                                .strategy(
+                                        request ->
+                                                Mono.just(
+                                                        Optional.of(
+                                                                List.of(
+                                                                        request.messages()
+                                                                                .get(3)))))
+                                .build()
+                        : config(true);
+        try {
+            List<Msg> result =
+                    new ConversationCompactor(new RecordingModel(), flush)
+                            .compactIfNeeded(
+                                    rc, compactableMessages(), settings, "agent", "session")
+                            .block(Duration.ofSeconds(2))
+                            .orElseThrow();
+            assertFalse(result.isEmpty());
+            assertTrue(MemoryBackgroundTasks.awaitQuiescence(5, TimeUnit.SECONDS));
+            verify(flush).flushSessionMemories(rc, log, log.sourceId());
+            verify(flush, never()).flushMemories(any(), anyList());
+            assertTrue(
+                    log.readAfter(0, 20).stream()
+                            .anyMatch(
+                                    event ->
+                                            event.type().equals("compaction/start")
+                                                    && event.payloadJson().contains("M1")));
+        } finally {
+            recorder.close();
+        }
+    }
+
+    @Test
+    void durableExtractionDoesNotDelaySummaryAndRetainsSubscriberContext() throws Exception {
+        RuntimeContext rc = RuntimeContext.builder().sessionId("slow-memory").build();
+        var log =
+                new InMemorySessionLogStore()
+                        .open(new SessionKey(null, "agent", "slow-memory"), rc);
+        SessionRecorder recorder = new SessionRecorder(log, "turn");
+        rc.put(SessionRecorder.CONTEXT_KEY, recorder);
+        Sinks.Empty<Void> release = Sinks.empty();
+        CountDownLatch started = new CountDownLatch(1);
+        MemoryFlushManager flush = mock(MemoryFlushManager.class);
+        when(flush.flushSessionMemories(rc, log, log.sourceId()))
+                .thenReturn(
+                        Mono.deferContextual(
+                                view -> {
+                                    assertEquals("trace-value", view.get("trace"));
+                                    started.countDown();
+                                    return release.asMono();
+                                }));
+        try {
+            assertTrue(
+                    new ConversationCompactor(new RecordingModel(), flush)
+                            .compactIfNeeded(
+                                    rc, compactableMessages(), config(true), "agent", "slow-memory")
+                            .contextWrite(context -> context.put("trace", "trace-value"))
+                            .block(Duration.ofSeconds(2))
+                            .isPresent());
+            assertTrue(started.await(5, TimeUnit.SECONDS));
+        } finally {
+            release.tryEmitEmpty();
+            assertTrue(MemoryBackgroundTasks.awaitQuiescence(5, TimeUnit.SECONDS));
+            recorder.close();
+        }
+    }
+
+    @Test
+    void requiredSourceLogFailureStillPreventsCompaction() {
+        SessionRecorder recorder = mock(SessionRecorder.class);
+        when(recorder.record(any(), any()))
+                .thenReturn(Mono.error(new SessionLogException("source commit failed")));
+        RuntimeContext rc = RuntimeContext.empty();
+        rc.put(SessionRecorder.CONTEXT_KEY, recorder);
+        Model model = mock(Model.class);
+        MemoryFlushManager flush = mock(MemoryFlushManager.class);
+        StepVerifier.create(
+                        new ConversationCompactor(model, flush)
+                                .compactIfNeeded(
+                                        rc,
+                                        compactableMessages(),
+                                        config(true),
+                                        "agent",
+                                        "session"))
+                .expectErrorMessage("source commit failed")
+                .verify();
+        verifyNoInteractions(model, flush);
+    }
+
+    @Test
+    void unchangedCustomStrategyDoesNotFlush() {
+        List<Msg> original = compactableMessages();
+        MemoryFlushManager flushManager = mock(MemoryFlushManager.class);
+        CompactionConfig config =
+                CompactionConfig.builder()
+                        .triggerMessages(3)
+                        .triggerTokens(0)
+                        .strategy(request -> Mono.just(Optional.of(request.messages())))
+                        .build();
+
+        assertEquals(
+                original,
+                new ConversationCompactor(new RecordingModel(), flushManager)
+                        .compactIfNeeded(mock(RuntimeContext.class), original, config, "agent", "s")
+                        .block()
+                        .orElseThrow());
+        verifyNoInteractions(flushManager);
     }
 
     /** Verifies that the durable compaction end event contains before and after metrics. */

@@ -22,9 +22,7 @@ import io.agentscope.core.middleware.AgentInput;
 import io.agentscope.harness.agent.IsolationScope;
 import io.agentscope.harness.agent.coordination.LocalPeriodicGate;
 import io.agentscope.harness.agent.coordination.PeriodicGate;
-import io.agentscope.harness.agent.filesystem.AbstractFilesystem;
 import io.agentscope.harness.agent.filesystem.model.FileInfo;
-import io.agentscope.harness.agent.filesystem.model.GlobResult;
 import io.agentscope.harness.agent.memory.MemoryBackgroundTasks;
 import io.agentscope.harness.agent.memory.MemoryConsolidator;
 import io.agentscope.harness.agent.workspace.WorkspaceConstants;
@@ -53,8 +51,7 @@ import reactor.util.context.ContextView;
  *
  * <p>Maintenance steps executed in order:
  * <ol>
- *   <li>Expire daily memory files older than {@code dailyFileRetentionDays} by moving
- *       them to {@code memory/archive/}.</li>
+ *   <li>Archive expired daily files; when consolidation is enabled, retain unfinished files.</li>
  *   <li>Run LLM-based consolidation ({@link MemoryConsolidator#consolidate}) if a
  *       consolidator is configured.</li>
  * </ol>
@@ -160,11 +157,15 @@ public class MemoryMaintenanceMiddleware implements HarnessRuntimeMiddleware {
 
     private void scheduleMaintenance(RuntimeContext rc, ContextView contextView) {
         MemoryBackgroundTasks.begin();
-        Mono.defer(() -> doMaintenance(rc))
-                .subscribeOn(Schedulers.boundedElastic())
+        maintain(rc)
                 .contextWrite(context -> context.putAll(contextView))
                 .doFinally(signal -> MemoryBackgroundTasks.end())
                 .subscribe(null, e -> log.warn("Memory maintenance failed: {}", e.getMessage()));
+    }
+
+    /** Runs the same throttled maintenance from a host recovery task. */
+    public Mono<Void> maintain(RuntimeContext rc) {
+        return Mono.defer(() -> doMaintenance(rc)).subscribeOn(Schedulers.boundedElastic());
     }
 
     private Mono<Void> doMaintenance(RuntimeContext rc) {
@@ -179,14 +180,11 @@ public class MemoryMaintenanceMiddleware implements HarnessRuntimeMiddleware {
                 .then(Mono.defer(() -> consolidateMemory(rc)));
     }
 
-    /**
-     * Builds a composite key from {@link IsolationScope} name and the per-call identity returned
-     * by {@link #timerKeyFor(RuntimeContext)}. The operation prefix keeps maintenance independent
-     * of flush when both use the same {@link PeriodicGate}. The scope prefix keeps different
-     * isolation dimensions from sharing a slot.
-     */
+    /** Includes the workspace so separate memory roots cannot starve one another. */
     private String compositeTimerKey(RuntimeContext rc) {
-        return "memory-maintenance:" + isolationScope.name() + ":" + timerKeyFor(rc);
+        var workspace = workspaceManager != null ? workspaceManager.getWorkspace() : null;
+        String root = workspace != null ? workspace.toAbsolutePath().normalize().toString() : "";
+        return "memory-maintenance:" + isolationScope.name() + ":" + root + ":" + timerKeyFor(rc);
     }
 
     /**
@@ -209,7 +207,7 @@ public class MemoryMaintenanceMiddleware implements HarnessRuntimeMiddleware {
             return Mono.empty();
         }
         return consolidator
-                .consolidate(rc)
+                .catchUp(rc)
                 .onErrorResume(
                         e -> {
                             log.warn("Memory consolidation failed: {}", e.getMessage());
@@ -218,17 +216,8 @@ public class MemoryMaintenanceMiddleware implements HarnessRuntimeMiddleware {
     }
 
     private void expireDailyFiles(RuntimeContext rc) {
-        AbstractFilesystem fs = workspaceManager.getFilesystem();
-        if (fs == null) {
-            return;
-        }
-        GlobResult glob = fs.glob(rc, "*.md", WorkspaceConstants.MEMORY_DIR);
-        if (glob == null || glob.matches() == null) {
-            return;
-        }
-
         LocalDate cutoff = LocalDate.now().minusDays(dailyFileRetentionDays);
-        for (FileInfo fi : glob.matches()) {
+        for (FileInfo fi : workspaceManager.listMemoryFileInfos(rc)) {
             if (fi.isDirectory()) {
                 continue;
             }
@@ -244,12 +233,17 @@ public class MemoryMaintenanceMiddleware implements HarnessRuntimeMiddleware {
                 LocalDate fileDate = LocalDate.parse(baseName);
                 if (fileDate.isBefore(cutoff)) {
                     String fromPath = WorkspaceConstants.MEMORY_DIR + "/" + fileName;
-                    String toPath = WorkspaceConstants.MEMORY_DIR + "/archive/" + fileName;
-                    fs.move(rc, fromPath, toPath);
-                    log.debug("Archived expired daily file: {}", fileName);
+                    String snapshot =
+                            consolidator == null
+                                    ? workspaceManager.atomicMemoryFile(rc, fromPath).read()
+                                    : consolidator.consolidatedSnapshot(rc, fi);
+                    if (snapshot != null
+                            && workspaceManager.archiveMemoryFile(rc, fromPath, snapshot))
+                        log.debug("Archived expired daily file: {}", fileName);
                 }
             } catch (Exception e) {
-                // not a date-named file, skip
+                if (!(e instanceof java.time.format.DateTimeParseException))
+                    log.warn("Failed to archive daily file {}: {}", fileName, e.getMessage());
             }
         }
     }

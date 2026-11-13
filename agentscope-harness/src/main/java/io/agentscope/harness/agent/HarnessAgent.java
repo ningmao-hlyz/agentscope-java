@@ -226,6 +226,7 @@ public class HarnessAgent implements Agent, AutoCloseable {
     private final SkillCurator skillCurator;
     private final SkillAuditLog skillAuditLog;
     private final MemoryConfig memoryConfig;
+    private final MemoryMaintenanceMiddleware memoryMaintenance;
     private final Toolkit ownedMcpToolkit;
 
     /** The subagent middleware (either SubagentsMiddleware or DynamicSubagentsMiddleware). */
@@ -259,6 +260,7 @@ public class HarnessAgent implements Agent, AutoCloseable {
             SkillCurator skillCurator,
             SkillAuditLog skillAuditLog,
             MemoryConfig memoryConfig,
+            MemoryMaintenanceMiddleware memoryMaintenance,
             Object subagentMiddleware,
             DistributedStore distributedStore,
             WorkspacePathNormalizer pathNormalizer,
@@ -280,6 +282,7 @@ public class HarnessAgent implements Agent, AutoCloseable {
         this.skillCurator = skillCurator;
         this.skillAuditLog = skillAuditLog;
         this.memoryConfig = memoryConfig != null ? memoryConfig : MemoryConfig.defaults();
+        this.memoryMaintenance = memoryMaintenance;
         this.subagentMiddleware = subagentMiddleware;
         this.distributedStore = distributedStore;
         this.pathNormalizer = pathNormalizer;
@@ -301,6 +304,75 @@ public class HarnessAgent implements Agent, AutoCloseable {
 
     public SessionLog sessionLog(RuntimeContext context) {
         return delegate.sessionLog(ensureSessionDefaults(context));
+    }
+
+    /**
+     * Catches up native-session memory without executing an agent turn. The host owns discovery
+     * and scheduling. Disabled memory hooks remain disabled; {@code NEVER} skips extraction but
+     * still permits throttled maintenance. Extraction retains its configured deadline and
+     * admission; maintenance has the same deadline for this recovery pass.
+     */
+    public Mono<Void> recoverMemory(RuntimeContext context) {
+        return recoverMemory(context, false);
+    }
+
+    /** Makes deferred memory eligible now, then runs normal recovery after configuration repair. */
+    public Mono<Void> retryDeferredMemory(RuntimeContext context) {
+        return recoverMemory(context, true);
+    }
+
+    private Mono<Void> recoverMemory(RuntimeContext context, boolean retryDeferred) {
+        return Mono.defer(
+                        () -> {
+                            if (memoryMaintenance == null) return Mono.empty();
+                            if (context == null
+                                    || context.getSessionId() == null
+                                    || context.getSessionId().isBlank())
+                                return Mono.error(
+                                        new IllegalArgumentException(
+                                                "Recovery requires a sessionId"));
+                            if (!delegate.sessionLogEnabled())
+                                return Mono.error(
+                                        new IllegalStateException(
+                                                "Memory recovery requires native session history"));
+                            RuntimeContext rc =
+                                    ensureSessionDefaults(RuntimeContext.builder(context).build());
+                            // Memory and native logs use persistent metadata storage, including
+                            // host-side metadata under a sandbox; no execution lease is acquired.
+                            Mono<Void> maintenance =
+                                    memoryMaintenance
+                                            .maintain(rc)
+                                            .timeout(memoryConfig.flushTimeout());
+                            Mono<Void> flush =
+                                    Mono.defer(
+                                            () -> {
+                                                if (memoryConfig.flushTrigger().mode()
+                                                        == MemoryConfig.FlushMode.NEVER)
+                                                    return Mono.empty();
+                                                Model effectiveModel =
+                                                        memoryConfig.model() != null
+                                                                ? memoryConfig.model()
+                                                                : delegate.getModel(rc);
+                                                MemoryFlushManager manager =
+                                                        MemoryFlushManager.configured(
+                                                                workspaceManager,
+                                                                effectiveModel,
+                                                                memoryConfig);
+                                                SessionLog source = sessionLog(rc);
+                                                String sourceId =
+                                                        source.sourceId() != null
+                                                                ? source.sourceId()
+                                                                : sessionKey(rc).storagePath();
+                                                return retryDeferred
+                                                        ? manager.retryDeferredMemories(
+                                                                rc, source, sourceId)
+                                                        : manager.flushSessionMemories(
+                                                                rc, source, sourceId);
+                                            });
+                            return flush.onErrorResume(error -> maintenance.then(Mono.error(error)))
+                                    .then(maintenance);
+                        })
+                .subscribeOn(Schedulers.boundedElastic());
     }
 
     public SessionProjection inspectSession(RuntimeContext context) {
@@ -1219,21 +1291,24 @@ public class HarnessAgent implements Agent, AutoCloseable {
         }
         // Decide before compaction, which may fold the input into the summary.
         List<Msg> retryInput = isInContext(msgs, allMsgs) ? List.of() : msgs;
-        String agentId = getName();
+        String agentId = sessionKey(ctx).agentId();
         String sessionId =
                 effective != null && effective.getSessionId() != null
                         ? effective.getSessionId()
                         : "default";
 
-        CompactionConfig forceConfig = CompactionConfig.builder().triggerMessages(1).build();
-        String effectiveFlushPrompt =
-                memoryConfig.flushPrompt() != null
-                        ? memoryConfig.flushPrompt()
-                        : MemoryFlushManager.DEFAULT_FLUSH_PROMPT;
-        // Overflow recovery summarizes through the agent's build-time default model, never the
-        // per-call model that just overflowed (same rule as CompactionMiddleware#overflowRecovery).
+        CompactionConfig forceConfig =
+                CompactionConfig.builder()
+                        .triggerMessages(1)
+                        .flushBeforeCompact(memoryMaintenance != null)
+                        .build();
         MemoryFlushManager fm =
-                new MemoryFlushManager(workspaceManager, getModel(), effectiveFlushPrompt);
+                MemoryFlushManager.configured(
+                        workspaceManager,
+                        memoryConfig.model() != null
+                                ? memoryConfig.model()
+                                : delegate.getModel(ctx),
+                        memoryConfig);
         ConversationCompactor compactor = new ConversationCompactor(getModel(), fm);
 
         return compactor
@@ -2997,22 +3072,18 @@ public class HarnessAgent implements Agent, AutoCloseable {
                                 : new WorkspaceSessionLogStore(wsManager));
             }
             Model memoryModel = memoryConfig.model() != null ? memoryConfig.model() : model;
+            MemoryMaintenanceMiddleware memoryMaintenance = null;
             if (memoryModel != null && !disableMemoryHooks) {
                 // Flush middleware gets the dedicated config model only (may be null): without
                 // one it resolves the executing agent's per-call model at flush time. The
                 // consolidator below still uses the resolved memoryModel.
                 IsolationScope effectiveIsolationScope = fsIsolationScope;
 
-                String effectiveFlushPrompt =
-                        memoryConfig.flushPrompt() != null
-                                ? memoryConfig.flushPrompt()
-                                : MemoryFlushManager.DEFAULT_FLUSH_PROMPT;
                 inner.middleware(
                         new MemoryFlushMiddleware(
                                 wsManager,
                                 memoryConfig.model(),
-                                effectiveFlushPrompt,
-                                memoryConfig.flushTrigger(),
+                                memoryConfig,
                                 effectiveIsolationScope,
                                 periodicGate));
 
@@ -3026,15 +3097,17 @@ public class HarnessAgent implements Agent, AutoCloseable {
                                 memoryModel,
                                 effectiveConsolidationPrompt,
                                 memoryConfig.consolidationMaxTokens(),
-                                distributedStore != null ? distributedStore.baseStore() : null);
-                inner.middleware(
+                                distributedStore != null ? distributedStore.baseStore() : null,
+                                memoryConfig.consolidationContextPolicy());
+                memoryMaintenance =
                         new MemoryMaintenanceMiddleware(
                                 wsManager,
                                 consolidator,
                                 memoryConfig.dailyFileRetentionDays(),
                                 memoryConfig.consolidationMinGap(),
                                 effectiveIsolationScope,
-                                periodicGate));
+                                periodicGate);
+                inner.middleware(memoryMaintenance);
             }
             CompactionMiddleware compactionHook = null;
             if (!disableCompaction && compactionConfig != null) {
@@ -3046,7 +3119,12 @@ public class HarnessAgent implements Agent, AutoCloseable {
                     // time. The gate above still requires a dedicated or default model to exist.
                     compactionHook =
                             new CompactionMiddleware(
-                                    wsManager, compactionConfig.getModel(), compactionConfig);
+                                    wsManager,
+                                    compactionConfig.getModel(),
+                                    disableMemoryHooks
+                                            ? compactionConfig.withoutMemoryFlush()
+                                            : compactionConfig,
+                                    memoryConfig);
                     inner.middleware(compactionHook.overflowRecovery());
                 }
             }
@@ -3139,7 +3217,8 @@ public class HarnessAgent implements Agent, AutoCloseable {
             if (!disableMemoryTools) {
                 agentToolkit.registerTool(new MemorySearchTool(wsManager));
                 agentToolkit.registerTool(new MemoryGetTool(wsManager));
-                agentToolkit.registerTool(new MemorySaveTool(wsManager));
+                agentToolkit.registerTool(
+                        new MemorySaveTool(wsManager, memoryConfig.consolidationMaxTokens()));
                 if (!legacySessionHistory) {
                     agentToolkit.registerTool(
                             new SessionSearchTool(
@@ -3446,6 +3525,7 @@ public class HarnessAgent implements Agent, AutoCloseable {
                     pendingSkillCurator,
                     pendingSkillAuditLog,
                     memoryConfig,
+                    memoryMaintenance,
                     capturedSubagentMw,
                     distributedStore,
                     pathNormalizer,

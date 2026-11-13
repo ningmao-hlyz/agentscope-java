@@ -90,29 +90,29 @@ class MemoryMiddlewareThrottleIsolationTest {
                         : new LocalPeriodicGate();
         WorkspaceManager workspace = mock(WorkspaceManager.class);
         MemoryConsolidator consolidator = mock(MemoryConsolidator.class);
-        when(consolidator.consolidate(RC)).thenReturn(Mono.empty());
+        when(consolidator.catchUp(RC)).thenReturn(Mono.empty());
         MemoryFlushMiddleware flush = flush(scope, gate);
         MemoryMaintenanceMiddleware maintenance = maintenance(workspace, consolidator, scope, gate);
 
         if (maintenanceFirst) {
             runMaintenance(maintenance);
-            verify(consolidator).consolidate(RC);
+            verify(consolidator).catchUp(RC);
             assertTrue(
                     flush.shouldFlushNow(RC), "maintenance must not consume the first flush slot");
         } else {
             assertTrue(flush.shouldFlushNow(RC));
             runMaintenance(maintenance);
-            verify(consolidator).consolidate(RC);
+            verify(consolidator).catchUp(RC);
         }
 
         assertFalse(flush.shouldFlushNow(RC), "repeated flush must respect its own gap");
         runMaintenance(maintenance);
-        verify(consolidator, times(1)).consolidate(RC);
+        verify(consolidator, times(1)).catchUp(RC);
 
         // Rebuilding middleware must preserve both windows for the same isolation key.
         assertFalse(flush(scope, gate).shouldFlushNow(RC));
         runMaintenance(maintenance(workspace, consolidator, scope, gate));
-        verify(consolidator, times(1)).consolidate(RC);
+        verify(consolidator, times(1)).catchUp(RC);
     }
 
     private static MemoryFlushMiddleware flush(IsolationScope scope, PeriodicGate gate) {

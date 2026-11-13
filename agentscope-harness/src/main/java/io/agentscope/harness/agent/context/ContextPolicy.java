@@ -15,6 +15,7 @@
  */
 package io.agentscope.harness.agent.context;
 
+import io.agentscope.core.middleware.ModelCallInput;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
@@ -37,6 +38,28 @@ public record ContextPolicy(
 
     public static ContextPolicy defaults() {
         return new ContextPolicy(0, 0, 0, ContextTokenEstimator.approximate(), manifest -> {});
+    }
+
+    /** Resolved input limit and output reservation, in tokens. */
+    public record Budget(long inputTokens, int outputTokens) {}
+
+    /** Resolves limits for a concrete model request. */
+    public Budget budget(ModelCallInput input) {
+        int window = input.model().getContextWindowSize();
+        int output = reservedOutputTokens;
+        if (output == 0) output = window > 0 ? Math.min(4096, Math.max(1, window / 8)) : 4096;
+        if (input.options() != null) {
+            if (input.options().getMaxTokens() != null)
+                output = Math.max(output, input.options().getMaxTokens());
+            if (input.options().getMaxCompletionTokens() != null)
+                output = Math.max(output, input.options().getMaxCompletionTokens());
+        }
+        long safety =
+                safetyMarginTokens > 0
+                        ? safetyMarginTokens
+                        : window > 0 ? Math.max(1, window / 50) : 1024;
+        long limit = window > 0 ? Math.max(0, (long) window - output - safety) : 64000;
+        return new Budget(maxInputTokens > 0 ? Math.min(limit, maxInputTokens) : limit, output);
     }
 
     /** Serializable numeric configuration; executable estimators/observers remain application-owned. */

@@ -377,7 +377,13 @@ public class WorkspaceIndex implements AutoCloseable {
      * indexed directory prefixes.
      */
     static boolean isIndexable(String path) {
-        if (path == null || path.isBlank() || path.endsWith(".cas-lock")) {
+        if (path == null
+                || path.isBlank()
+                || path.endsWith(".cas-lock")
+                || path.startsWith("memory/.flush-state/")
+                || path.equals("memory/.consolidation-progress.json")
+                || path.equals("memory/.consolidation_state")) {
+
             return false;
         }
         for (String prefix : INDEXED_PREFIXES) {

@@ -52,16 +52,17 @@ class WorkspaceIndexPrefixMatchTest {
     }
 
     @Test
-    void lockFilesAreExcludedFromIndexAndDiskRebuild() throws Exception {
-        String internal = "memory/2026-11-13.md.cas-lock";
+    void memoryStateIsExcludedFromIndexAndDiskRebuild() throws Exception {
+        String internal = "memory/.flush-state/source.json";
         Path state = workspaceRoot.resolve(internal);
         java.nio.file.Files.createDirectories(state.getParent());
         java.nio.file.Files.writeString(state, "{}", java.nio.charset.StandardCharsets.UTF_8);
         index.upsert(internal, 2, null);
         index.rebuildFromDisk(workspaceRoot);
         assertFalse(index.exists(internal));
-        assertFalse(index.hasPrefix("memory/"));
+        assertFalse(index.hasPrefix("memory/.flush-state/"));
         assertTrue(index.listByPrefix("memory/").isEmpty());
+        assertFalse(WorkspaceIndex.isIndexable("memory/.consolidation-progress.json"));
     }
 
     @Test

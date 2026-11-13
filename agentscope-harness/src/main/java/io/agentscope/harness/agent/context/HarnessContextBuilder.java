@@ -589,21 +589,7 @@ public final class HarnessContextBuilder implements ModelRequestPreparer {
     }
 
     private long inputLimit(ModelCallInput input) {
-        long window = input.model().getContextWindowSize();
-        long output = policy.reservedOutputTokens();
-        if (output == 0) output = window > 0 ? Math.min(4096, Math.max(1, window / 8)) : 4096;
-        if (input.options() != null) {
-            if (input.options().getMaxTokens() != null)
-                output = Math.max(output, input.options().getMaxTokens());
-            if (input.options().getMaxCompletionTokens() != null)
-                output = Math.max(output, input.options().getMaxCompletionTokens());
-        }
-        long safety =
-                policy.safetyMarginTokens() > 0
-                        ? policy.safetyMarginTokens()
-                        : window > 0 ? Math.max(1, window / 50) : 1024;
-        long limit = window > 0 ? Math.max(0, window - output - safety) : 64000;
-        return policy.maxInputTokens() > 0 ? Math.min(limit, policy.maxInputTokens()) : limit;
+        return policy.budget(input).inputTokens();
     }
 
     private static ModelCallInput copy(ModelCallInput input, List<Msg> messages) {
