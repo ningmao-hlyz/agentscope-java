@@ -10,6 +10,10 @@ en_link: /v2/en/docs/others/release-notes
 
 ## 尚未发布
 
+### 生成选项兼容性
+
+`GenerateOptions.mergeOptions(primary, fallback)` 将 `maxTokens` 与 `maxCompletionTokens` 视为替代的输出上限：primary 设置其中一个时，会替换 fallback 的两项。比如请求设置 `maxTokens=1000` 后，不再同时继承默认的 `maxCompletionTokens=8000`；需要同时发送两项的调用方须显式设置两项。
+
 ### Harness 工作区队列兼容性
 
 文件系统支持的 `WorkspaceMessageBus` 队列将以 `{id}.payload` 和 `{id}.ready` 发布条目，不再只使用单个 `{id}.json` 文件（[#3281](https://github.com/agentscope-ai/agentscope-java/pull/3281)）。旧版消费实例只扫描 `.json`，看不到新版条目。使用共享后端时，应先升级全部队列消费实例，再让新版生产实例发布消息；也可以在滚动升级期间暂停队列流量。

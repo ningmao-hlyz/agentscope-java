@@ -10,6 +10,10 @@ This page tracks per-version changes for AgentScope Java 2.0. For the overall mi
 
 ## Unreleased
 
+### Generation option compatibility
+
+`GenerateOptions.mergeOptions(primary, fallback)` treats `maxTokens` and `maxCompletionTokens` as alternative output limits: setting either in `primary` replaces both fallback limits. For example, a request with `maxTokens=1000` no longer retains a default `maxCompletionTokens=8000`. Callers needing both fields must set both explicitly.
+
 ### Harness workspace queue compatibility
 
 The filesystem-backed `WorkspaceMessageBus` queue will publish `{id}.payload` and `{id}.ready` instead of a single `{id}.json` ([#3281](https://github.com/agentscope-ai/agentscope-java/pull/3281)). Older drain-side instances scan only `.json` and cannot see new entries. On a shared backend, upgrade all drain-side instances before new writers publish, or pause queue traffic during the rollout.

@@ -223,6 +223,11 @@ public class OpenAIChatModel extends ChatModelBase {
                                 .build()));
     }
 
+    @Override
+    public GenerateOptions getDefaultGenerateOptions() {
+        return configuredOptions;
+    }
+
     /**
      * Gets the model name for logging and identification.
      *

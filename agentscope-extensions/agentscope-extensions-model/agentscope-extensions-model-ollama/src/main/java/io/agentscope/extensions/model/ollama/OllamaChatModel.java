@@ -131,6 +131,11 @@ public class OllamaChatModel extends ChatModelBase {
     }
 
     @Override
+    public GenerateOptions getDefaultGenerateOptions() {
+        return defaultOptions.toGenerateOptions();
+    }
+
+    @Override
     public String getModelName() {
         return this.modelName;
     }

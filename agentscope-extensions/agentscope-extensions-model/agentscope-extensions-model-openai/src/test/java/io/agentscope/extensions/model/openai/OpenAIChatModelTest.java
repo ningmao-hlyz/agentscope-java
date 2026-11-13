@@ -51,6 +51,8 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import reactor.test.StepVerifier;
 
 /**
@@ -326,6 +328,53 @@ class OpenAIChatModelTest {
         JsonNode overriddenStrict = responseFormatStrict(mockServer.takeRequest());
         assertTrue(overriddenStrict.isBoolean());
         assertFalse(overriddenStrict.asBoolean());
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void testOutputDefaultsAndOverridesPreserveOneWireParameter(boolean completionTokens)
+            throws Exception {
+        GenerateOptions defaults =
+                completionTokens
+                        ? GenerateOptions.builder().maxCompletionTokens(8192).build()
+                        : GenerateOptions.builder().maxTokens(8192).build();
+        OpenAIChatModel configured =
+                OpenAIChatModel.builder()
+                        .apiKey("test-api-key")
+                        .modelName("test-output-limit")
+                        .stream(false)
+                        .baseUrl(mockServer.url("/").toString().replaceAll("/$", ""))
+                        .httpTransport(transport)
+                        .generateOptions(defaults)
+                        .build();
+        GenerateOptions exposed = configured.getDefaultGenerateOptions();
+        assertEquals(defaults.getMaxTokens(), exposed.getMaxTokens());
+        assertEquals(defaults.getMaxCompletionTokens(), exposed.getMaxCompletionTokens());
+        List<Msg> messages = List.of(Msg.builder().role(MsgRole.USER).textContent("Hello").build());
+        enqueueCompletionResponse();
+        configured.stream(messages, null, exposed).blockLast(Duration.ofSeconds(5));
+        RecordedRequest request = mockServer.takeRequest(1, TimeUnit.SECONDS);
+        assertNotNull(request);
+        Map<?, ?> body = JsonUtils.getJsonCodec().fromJson(request.getBody().readUtf8(), Map.class);
+        assertEquals(8192, body.get(completionTokens ? "max_completion_tokens" : "max_tokens"));
+        assertFalse(body.containsKey(completionTokens ? "max_tokens" : "max_completion_tokens"));
+
+        GenerateOptions override =
+                completionTokens
+                        ? GenerateOptions.builder().maxTokens(128).build()
+                        : GenerateOptions.builder().maxCompletionTokens(128).build();
+        enqueueCompletionResponse();
+        configured.stream(messages, null, override).blockLast(Duration.ofSeconds(5));
+        request = mockServer.takeRequest(1, TimeUnit.SECONDS);
+        assertNotNull(request);
+        body = JsonUtils.getJsonCodec().fromJson(request.getBody().readUtf8(), Map.class);
+        assertEquals(128, body.get(completionTokens ? "max_tokens" : "max_completion_tokens"));
+        assertFalse(body.containsKey(completionTokens ? "max_completion_tokens" : "max_tokens"));
+        assertEquals(
+                8192,
+                completionTokens
+                        ? configured.getDefaultGenerateOptions().getMaxCompletionTokens()
+                        : configured.getDefaultGenerateOptions().getMaxTokens());
     }
 
     private static ResponseFormat responseFormat(Boolean strict) {

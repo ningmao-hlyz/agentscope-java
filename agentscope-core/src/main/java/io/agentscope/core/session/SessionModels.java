@@ -59,6 +59,10 @@ public final class SessionModels {
             return delegate.getContextWindowSize();
         }
 
+        public GenerateOptions getDefaultGenerateOptions() {
+            return delegate.getDefaultGenerateOptions();
+        }
+
         public Flux<ChatResponse> stream(
                 List<Msg> messages, List<ToolSchema> tools, GenerateOptions options) {
             return Flux.defer(

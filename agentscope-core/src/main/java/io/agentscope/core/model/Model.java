@@ -41,6 +41,11 @@ public interface Model {
      */
     String getModelName();
 
+    /** Returns configured generation defaults, or {@code null} when unavailable. */
+    default GenerateOptions getDefaultGenerateOptions() {
+        return null;
+    }
+
     /** Native client-side tool loading protocol; ordinary function calling is the default. */
     default ToolSearchMode getToolSearchMode() {
         return ToolSearchMode.FUNCTION;

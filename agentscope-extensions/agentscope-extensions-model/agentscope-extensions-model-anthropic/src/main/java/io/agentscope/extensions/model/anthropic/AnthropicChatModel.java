@@ -382,6 +382,11 @@ public class AnthropicChatModel extends ChatModelBase {
                 "anthropic");
     }
 
+    @Override
+    public GenerateOptions getDefaultGenerateOptions() {
+        return defaultOptions;
+    }
+
     /**
      * Gets the model name for logging and identification.
      *

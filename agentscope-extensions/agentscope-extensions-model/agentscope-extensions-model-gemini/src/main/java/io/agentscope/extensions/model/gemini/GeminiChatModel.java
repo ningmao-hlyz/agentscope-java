@@ -392,6 +392,11 @@ public class GeminiChatModel extends ChatModelBase {
     }
 
     @Override
+    public GenerateOptions getDefaultGenerateOptions() {
+        return defaultOptions;
+    }
+
+    @Override
     public String getModelName() {
         return modelName;
     }

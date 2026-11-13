@@ -499,6 +499,11 @@ public class DashScopeChatModel extends ChatModelBase {
         request.getParameters().setToolChoice("auto");
     }
 
+    @Override
+    public GenerateOptions getDefaultGenerateOptions() {
+        return defaultOptions;
+    }
+
     /**
      * Gets the model name for logging and identification.
      *

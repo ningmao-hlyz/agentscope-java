@@ -98,6 +98,11 @@ public class OpenAIResponsesChatModel extends ChatModelBase {
     }
 
     @Override
+    public GenerateOptions getDefaultGenerateOptions() {
+        return configuredOptions;
+    }
+
+    @Override
     public String getModelName() {
         return configuredOptions != null ? configuredOptions.getModelName() : null;
     }
