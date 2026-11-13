@@ -60,6 +60,19 @@ class RemoteFilesystemCASTest {
     }
 
     @Test
+    void conditionalRelativeWritesRemainVisibleThroughOverlay() {
+        var lower = newFs(new InMemoryStore());
+        assertTrue(lower.atomicTextFile(CTX, "memory/day.md", true).compareAndSet(null, "shared"));
+        assertTrue(lower.exists(CTX, "memory/day.md"));
+        var overlay = new OverlayFilesystem(newFs(new InMemoryStore()), lower);
+        var file = overlay.atomicTextFile(CTX, "memory/day.md", true);
+        assertEquals("shared", file.read());
+        assertTrue(file.compareAndSet("shared", "private"));
+        assertFalse(file.compareAndDelete("private"));
+        assertEquals("private", file.read());
+    }
+
+    @Test
     void edit_rejectsNullNewString_andEmptyOldString() {
         InMemoryStore store = new InMemoryStore();
         RemoteFilesystem fs = newFs(store);
