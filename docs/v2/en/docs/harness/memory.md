@@ -84,7 +84,7 @@ Flush persists output, appends it to `memory/YYYY-MM-DD.md`, then confirms its r
 
 Each model attempt first persists its source reference: native mode stores event ranges and message offsets, reading the same log on retry; legacy context mode retains source text. Cancellation or exit leaves a lease lasting `flushTimeout` plus the current backoff. Extraction or admission failures record a cooldown before reporting an error; later calls can process other sources. Each trigger retries at most one batch, selecting the earliest due across current and upgrade queues, with delays from 60 seconds to 30 minutes. Each state file retains at most 64 failed batches: a full queue or isolation write failure retains the source cursor. JEV errors do not bypass admission and failed facts are not discarded. Delivery and receipt failures still replay prepared output.
 
-After configuration repair, subscribe to `agent.retryDeferredMemory(context)` to make failures eligible immediately, using normal recovery identity, switches and configuration. The low-level `MemoryFlushManager.retryDeferredMemories(...)` methods remain available. This overrides attempt leases, so stop related executions first. Service workers honor backoff and expose no manual retry endpoint.
+After configuration repair, subscribe to `agent.retryDeferredMemory(context)` to make failures eligible immediately, using normal recovery identity, switches and configuration. The low-level `MemoryFlushManager.retryDeferredMemories(...)` methods remain available. This overrides attempt leases, so stop related executions first; a concurrent state change reports an error and the caller can retry.
 
 `flushTimeout` defaults to two minutes for the whole flush, including manager scheduling, all extraction batches and candidate judgments, excluding middleware queue wait. Timeout cancels upstream and releases the namespace queue; completed batches remain committed and unfinished sources retry on a later trigger. Custom code must honor cancellation or interruption to release its own resources.
 
@@ -102,7 +102,7 @@ The maintenance gate includes the normalized workspace root and isolation identi
 
 Discovery and scheduling belong to the host lifecycle, outside rebuilt request agents. Use a durable session catalogue or scoped `SessionLogStore.list(context)` where supported; a scope-local list cannot discover other users or inaccessible namespaces. Agent recreation preserves progress through the same files and log cursor. No source backlog means no extraction call; no ledger backlog means no consolidation call.
 
-Service provides an [opt-in recovery worker](/v2/en/service/operations#dormant-session-memory). Without host scheduling, recovery still needs another request or compaction trigger. All replicas stopped, missing source logs and permanent model/storage failures cannot complete catch-up.
+Without host scheduling, recovery still needs another request or compaction trigger. All replicas stopped, missing source logs and permanent model/storage failures cannot complete catch-up.
 
 ### Optional admission
 
