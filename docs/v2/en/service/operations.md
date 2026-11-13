@@ -177,6 +177,24 @@ Keep the session ID, turn ID, latest event ID, HTTP status and sanitized error. 
 
 See [Sessions and tasks](/v2/en/service/session-event-log) and [SSE replay](/v2/en/service/sse-events). Applications retain Sessions, Turns, and cursors without managing internal runtime identity mappings.
 
+## Dormant session memory
+
+Dataplane memory recovery is off by default. Add these variables to the Dataplane process/container environment and restart it:
+
+```bash
+BUILDER_MEMORY_RECOVERY_ENABLED=true
+BUILDER_MEMORY_RECOVERY_POLL_MS=60000
+BUILDER_MEMORY_RECOVERY_BATCH_SIZE=10
+```
+
+A dedicated worker scans one sorted page of the durable native-session catalogue per pass, then waits `poll-ms` (minimum 1,000). `batch-size` is 1–256. Each session attempt has a five-minute deadline, so a page of 10 failed attempts can take 50 minutes before the next delay; this is not a completion SLA. Failed sessions back off for 1, 2, 4, 8, 16, then 30 minutes without blocking later pages. The last 1,024 failures are retained in process memory; restart/eviction resets backoff, while extraction and consolidation progress remain durable. Shutdown cancels the active subscription.
+
+The worker resolves the owner's session snapshot, model override and environment, builds an uncached memory runtime and releases it after use. It invokes extraction and throttled consolidation, preserving the default 30-minute maintenance gap and one-batch-per-run progress. Existing consolidation errors are logged and retried after that gap; they do not all propagate to worker backoff. MCP connections, agent turns, tools and sandbox execution are not started. Shared `memory-stores/` mounts are read-only and are not write targets.
+
+Only root sessions registered in the Dataplane catalogue are scanned. Deleted sessions and identity mismatches are skipped/rejected; child logs have no independently resolved runtime here. Legacy history, external/hosted agents, missing catalogue entries and custom host configurations need their own recovery integration. Service currently uses default `MemoryConfig`; it does not configure a JEV memory admission adapter. Custom Harness hosts retain their configured admission through `recoverMemory(context)`.
+
+Replicas must share native logs and the complete memory namespace. Duplicate scans/model calls across replicas are allowed; existing conditional commits guard writes, without a new worker lease. This worker does not run while every Dataplane replica is stopped, and cannot recover pruned source logs or permanently unavailable dependencies. It does not make MEMORY/progress updates one transaction; a crash between those commits can replay a consolidation batch.
+
 ## Updating Control Plane naming
 
 The Go component lives in `agentscope-service/service-controlplane` and its server binary is `service-controlplane`. When updating an existing installation, update build paths, startup commands, deployment manifests, and environment variables together. Control Plane configuration uses the `CONTROL_PLANE_` prefix; HTTP clients use `CONTROL_PLANE_HTTP`, while the CLI and Runtime Host use `CONTROL_PLANE_URL`. The CLI is `as` and the Runtime Host executable is `agentscope-runtime-host`. Use the environment templates shipped with the same Service version to avoid combining old configuration with new binaries.

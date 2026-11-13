@@ -196,6 +196,45 @@ public class HarnessAgentBuildService {
         return agentCache.computeIfAbsent(cacheKey, k -> build(session, spec, resolved, k));
     }
 
+    /** Builds an uncached memory runtime without MCP or session-resource materialization. */
+    public HarnessAgent buildMemoryRecoveryAgent(SessionResolveResult resolved) {
+        ManagedSessionDto session = resolved.session();
+        AgentVersionSnapshot snapshot = snapshotFromResolve(resolved);
+        if (snapshot == null)
+            throw new IllegalStateException("Agent snapshot missing for memory recovery");
+        String modelName = snapshot.model();
+        if (session.agentOverridesJson() != null && !session.agentOverridesJson().isBlank()) {
+            Object override = parseOverrides(session.agentOverridesJson()).get("model");
+            if (override instanceof String value) modelName = value;
+        }
+        HarnessAgent.Builder b =
+                HarnessAgent.builder()
+                        .agentId(sessionLogAgentId(session))
+                        .name(snapshot.name() != null ? snapshot.name() : session.agentId())
+                        .workspace(resolveSessionWorkspace(session, resolved))
+                        .stateStore(agentStateStore)
+                        .disableToolsConfig()
+                        .disableFilesystemTools()
+                        .disableShellTool()
+                        .disableWebTools()
+                        .disableSubagents()
+                        .disableDynamicSkills()
+                        .disableDefaultWorkspaceSkills()
+                        .disableMemoryTools()
+                        .disableCompaction()
+                        .disableWorkspaceContext();
+        applyModel(b, modelName);
+        if (sessionLogStore != null) b.sessionLogStore(sessionLogStore);
+        // Shared memory-store mounts are read-only; private working memory uses this environment.
+        environmentSpecFactory.applyEnvironment(b, resolved.environment());
+        return b.build();
+    }
+
+    private void applyModel(HarnessAgent.Builder builder, String modelName) {
+        if (modelName != null && !modelName.isBlank()) builder.model(modelName);
+        else if (model != null) builder.model(model);
+    }
+
     /** Includes resource revisions so credential rotation and environment edits affect the next turn. */
     static String materializationFingerprint(
             SessionResolveResult resolved, SessionAgentBuildSpec spec) {
@@ -417,11 +456,7 @@ public class HarnessAgentBuildService {
             b.maxIters(maxIters);
         }
         // Model: prefer per-agent override, fall back to the data-plane default model.
-        if (modelName != null && !modelName.isBlank()) {
-            b.model(modelName);
-        } else if (model != null) {
-            b.model(model);
-        }
+        applyModel(b, modelName);
         b.workspace(workspace);
         b.stateStore(agentStateStore);
         if (sessionLogStore != null) b.sessionLogStore(sessionLogStore);

@@ -15,7 +15,11 @@
  */
 package io.agentscope.builder.web.persistence.jpa;
 
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
 
 public interface SessionExportSourceRepository
-        extends JpaRepository<SessionExportSourceEntity, String> {}
+        extends JpaRepository<SessionExportSourceEntity, String> {
+    Page<SessionExportSourceEntity> findByParentSessionIdIsNull(Pageable pageable);
+}

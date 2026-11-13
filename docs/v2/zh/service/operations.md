@@ -175,6 +175,24 @@ Gateway 正常不代表模型或工具执行正常。Managed 会话故障查看 
 
 具体请求见[会话与任务](/v2/zh/service/session-event-log)，刷新和断线恢复见 [SSE 文档](/v2/zh/service/sse-events)。应用只需要保存 Session、Turn 和游标，无需参与内部运行时记录的映射。
 
+## 无人访问会话的记忆补偿
+
+Dataplane 的记忆补偿默认关闭。在 Dataplane 进程／容器环境中加入以下变量并重启：
+
+```bash
+BUILDER_MEMORY_RECOVERY_ENABLED=true
+BUILDER_MEMORY_RECOVERY_POLL_MS=60000
+BUILDER_MEMORY_RECOVERY_BATCH_SIZE=10
+```
+
+独立 worker 每轮按序扫描持久原生会话目录的一页，然后等待 `poll-ms`（至少 1,000）；`batch-size` 范围为 1–256。单会话尝试限时五分钟，因此一页 10 个失败尝试可能耗时 50 分钟后才开始下一次间隔，不承诺补齐时限。失败会话按 1、2、4、8、16、30 分钟退避，不阻止翻页；内存最多保留最近 1,024 个失败状态，重启或淘汰会重置退避，抽取与 consolidation 进度仍持久保存。服务停止会取消当前订阅。
+
+worker 解析所属用户的会话快照、模型覆盖和环境，临时构建记忆运行时，用后释放。执行抽取与节流 consolidation，保留默认 30 分钟维护间隔和每次一个批次的进度。既有 consolidation 错误记日志并等待该间隔重试，并非全部传播到 worker 退避。此路径不连接 MCP、不执行 agent 回合、工具或 sandbox；共享 `memory-stores/` 挂载为只读，不作为写入目标。
+
+扫描范围仅为 Dataplane 目录中已登记的根会话；已删除会话和身份不匹配的来源会跳过／拒绝，子会话日志尚无独立配置解析。旧历史模式、外部／Hosted agent、目录缺项及自定义宿主配置需要自行接入恢复。Service 当前使用默认 `MemoryConfig`，未配置 JEV 记忆准入适配器；自定义 Harness 宿主通过 `recoverMemory(context)` 保留自身准入配置。
+
+多副本须共享原生日志与整个记忆命名空间。允许副本重复扫描和调用模型，写入仍使用既有条件提交，不新增 worker 租约。所有 Dataplane 副本停机时任务不运行；已清理的原文或永久不可用的依赖无法补齐。MEMORY 与进度未合并为事务，二者提交之间崩溃仍可能重放 consolidation 批次。
+
 ## 更新 Control Plane 名称
 
 Go 组件位于 `agentscope-service/service-controlplane`，服务端二进制名为 `service-controlplane`。升级已有部署时，需要一起更新构建路径、启动命令、部署清单和环境变量。Control Plane 配置统一使用 `CONTROL_PLANE_` 前缀；HTTP 客户端使用 `CONTROL_PLANE_HTTP`，CLI 和 Runtime Host 使用 `CONTROL_PLANE_URL`。命令行工具使用 `as`，Runtime Host 可执行文件改为 `agentscope-runtime-host`。建议以同一 Service 版本附带的环境配置模板为准，避免新二进制加载旧配置。

@@ -80,6 +80,12 @@ builder:
   # Platform-wide shared workspace root — MUST match the control plane layout.
   workspace-root: ${BUILDER_WORKSPACE_ROOT:${user.home}/.agentscope/builder/workspace}
 
+  # Dormant-session memory catch-up; owns a separate worker thread.
+  memory-recovery:
+    enabled: ${BUILDER_MEMORY_RECOVERY_ENABLED:false}
+    poll-ms: ${BUILDER_MEMORY_RECOVERY_POLL_MS:60000}
+    batch-size: ${BUILDER_MEMORY_RECOVERY_BATCH_SIZE:10}
+
   # ---- Tool confirmation (HITL) ----
   tool-confirmation:
     timeout-ms: ${BUILDER_TOOL_CONFIRMATION_TIMEOUT_MS:3600000}
