@@ -102,7 +102,7 @@ The maintenance gate includes the normalized workspace root and isolation identi
 
 Discovery and scheduling belong to the host lifecycle, outside rebuilt request agents. Use a durable session catalogue or scoped `SessionLogStore.list(context)` where supported; a scope-local list cannot discover other users or inaccessible namespaces. Agent recreation preserves progress through the same files and log cursor. No source backlog means no extraction call; no ledger backlog means no consolidation call.
 
-Without host scheduling, recovery still needs another request or compaction trigger. All replicas stopped, missing source logs and permanent model/storage failures cannot complete catch-up.
+Service provides an [opt-in recovery worker](/v2/en/service/operations#dormant-session-memory). Without host scheduling, recovery still needs another request or compaction trigger. All replicas stopped, missing source logs and permanent model/storage failures cannot complete catch-up.
 
 ### Optional admission
 
