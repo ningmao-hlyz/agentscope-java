@@ -133,6 +133,16 @@ class RocketMqExecutionTest {
     }
 
     static final Duration POLL = Duration.ofMillis(10);
+
+    /**
+     * How long the fake broker waits for an ack before offering a message again. It has to stay
+     * well above consumer latency: a message that is still being processed when the window closes
+     * is delivered twice, which is not what these tests assert. At 50ms a slow CI machine acked
+     * after the window, so a single CANCEL produced {@code commandAcks == 2} and the recovery test
+     * saw the same duplicate EXECUTE repeatedly.
+     */
+    static final long ACK_TIMEOUT_MILLIS = 1000;
+
     static final ClientServiceProvider FACTORY = ClientServiceProvider.loadService();
     static final RocketMqExecutionTopology.Route TOPOLOGY =
             RocketMqExecutionTopology.route(RocketMqExecutionTopology.DEFAULT_NAMESPACE, "hands");
@@ -288,7 +298,7 @@ class RocketMqExecutionTest {
                                         () -> {
                                             if (!acked.contains(message)) queue.add(message);
                                         },
-                                        50,
+                                        ACK_TIMEOUT_MILLIS,
                                         TimeUnit.MILLISECONDS);
                                 return List.of(message);
                             });
