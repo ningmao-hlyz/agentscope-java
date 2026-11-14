@@ -1,0 +1,83 @@
+# Temporary probe, not for merge: repeats one test class on a GitHub-hosted
+# runner so that flakes which never reproduce on the author's machine can be
+# observed, and so that a fix can be checked against the same runner.
+name: Flake probe
+on:
+  workflow_dispatch:
+    inputs:
+      module:
+        description: "Maven module path, e.g. agentscope-harness"
+        required: true
+        type: string
+      tests:
+        description: "Surefire -Dtest value, e.g. RocketMqExecutionTest"
+        required: true
+        type: string
+      os:
+        description: "Runner label"
+        required: true
+        default: ubuntu-latest
+        type: string
+      repeats:
+        description: "How many times to run the class"
+        required: false
+        default: "10"
+        type: string
+
+jobs:
+  probe:
+    runs-on: ${{ inputs.os }}
+    timeout-minutes: 100
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Cache Maven repository
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: probe-${{ runner.os }}-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            probe-${{ runner.os }}-
+            maven-${{ runner.os }}-
+
+      - name: Build dependencies
+        shell: bash
+        run: |
+          mvn -B -pl "${{ inputs.module }}" -am -DskipTests \
+            -Dmaven.javadoc.skip=true -Dmaven.source.skip=true \
+            -Djacoco.skip=true -Dspotless.check.skip=true \
+            -DskipDurableWindowsTests=true install
+
+      - name: Repeat the class
+        shell: bash
+        run: |
+          set -u
+          failures=0
+          for i in $(seq 1 "${{ inputs.repeats }}"); do
+            echo "===== run $i ====="
+            if mvn -B -pl "${{ inputs.module }}" \
+                 -Dtest="${{ inputs.tests }}" \
+                 -DfailIfNoTests=false -Dsurefire.failIfNoSpecifiedTests=false \
+                 -Djacoco.skip=true -Dspotless.check.skip=true \
+                 -DskipDurableWindowsTests=true test; then
+              echo "run $i: pass"
+            else
+              echo "run $i: FAIL"
+              failures=$((failures + 1))
+              for report in "${{ inputs.module }}"/target/surefire-reports/*.txt; do
+                [ -f "$report" ] || continue
+                if grep -qE "<<< (FAILURE|ERROR)" "$report"; then
+                  echo "----- $report"
+                  sed -n '1,60p' "$report"
+                fi
+              done
+            fi
+          done
+          echoed=$(grep -hE "^Tests run:" "${{ inputs.module }}"/target/surefire-reports/*.txt 2>/dev/null | tail -3)
+          echo "last report summary: $echoed"
+          echo "RESULT: $failures failure(s) in ${{ inputs.repeats }} run(s) on ${{ inputs.os }}"
+          if [ "$failures" -gt 0 ]; then exit 1; fi
