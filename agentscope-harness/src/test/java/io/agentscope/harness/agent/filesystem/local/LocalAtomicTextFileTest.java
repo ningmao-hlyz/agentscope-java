@@ -32,6 +32,7 @@ import io.agentscope.core.agent.RuntimeContext;
 import io.agentscope.core.util.ExceptionUtils;
 import io.agentscope.harness.agent.filesystem.AtomicTextFile;
 import io.agentscope.harness.agent.workspace.WorkspaceIndex;
+import java.io.Closeable;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.channels.FileChannel;
@@ -43,6 +44,7 @@ import java.nio.file.StandardCopyOption;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.CleanupMode;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -208,7 +210,10 @@ class LocalAtomicTextFileTest {
     }
 
     @Test
-    void independentJvmsCannotOverwriteOneAnothersConditionalUpdates() throws Exception {
+    void independentJvmsCannotOverwriteOneAnothersConditionalUpdates(
+            // Windows can keep a redirected log locked for a moment after the process exits, and a
+            // failed delete would fail the whole class as an extension-context error.
+            @TempDir(cleanup = CleanupMode.NEVER) Path directory) throws Exception {
         Path target = directory.resolve("counter.txt");
         Files.writeString(target, "0", StandardCharsets.UTF_8);
         Path gate = directory.resolve("gate");
@@ -240,8 +245,32 @@ class LocalAtomicTextFileTest {
                     0, second.exitValue(), Files.readString(directory.resolve("writer-2.log")));
             assertEquals("40", Files.readString(target, StandardCharsets.UTF_8));
         } finally {
-            first.destroyForcibly();
-            second.destroyForcibly();
+            stop(first);
+            stop(second);
+        }
+    }
+
+    /**
+     * Releases a child process and its three stream handles. Windows keeps the redirected log file
+     * locked until those handles are closed, which otherwise breaks the temp-directory cleanup.
+     */
+    private static void stop(Process process) {
+        process.destroyForcibly();
+        try {
+            process.waitFor(10, TimeUnit.SECONDS);
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+        }
+        closeQuietly(process.getInputStream());
+        closeQuietly(process.getErrorStream());
+        closeQuietly(process.getOutputStream());
+    }
+
+    private static void closeQuietly(Closeable stream) {
+        try {
+            stream.close();
+        } catch (IOException ignored) {
+            // Already closed, or the redirect never opened a stream.
         }
     }
 
