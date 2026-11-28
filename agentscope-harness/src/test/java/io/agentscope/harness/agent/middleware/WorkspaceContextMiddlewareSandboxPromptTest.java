@@ -28,6 +28,7 @@ import io.agentscope.core.agent.RuntimeContext;
 import io.agentscope.harness.agent.context.WorkspaceContextMaterials;
 import io.agentscope.harness.agent.filesystem.OverlayFilesystem;
 import io.agentscope.harness.agent.filesystem.RoutedSandboxFilesystem;
+import io.agentscope.harness.agent.filesystem.ShellSyntax;
 import io.agentscope.harness.agent.filesystem.local.LocalFilesystemWithShell;
 import io.agentscope.harness.agent.filesystem.model.FileData;
 import io.agentscope.harness.agent.filesystem.model.FileInfo;
@@ -367,6 +368,38 @@ class WorkspaceContextMiddlewareSandboxPromptTest {
             assertTrue(prompt.contains("The host JVM temporary directory is:"));
             assertFalse(prompt.contains("Sandbox root:"));
             assertFalse(prompt.contains("container"));
+        }
+    }
+
+    @Test
+    void overlayWrappedLocalShellIsDescribedByItsUpper(@TempDir Path workspace) {
+        // A bare OverlayFilesystem is not an AbstractSandboxFilesystem, so asking the wrapper for
+        // its syntax answers POSIX even when the upper runs cmd.exe. The paragraph must ask the
+        // layer that actually executes.
+        var upper = new FixedShellFilesystem(workspace, ShellSyntax.CMD);
+        try (WorkspaceManager wm =
+                new WorkspaceManager(
+                        workspace,
+                        new OverlayFilesystem(upper, new LocalFilesystemWithShell(workspace)))) {
+            String prompt = prompt(wm, false);
+
+            assertTrue(prompt.contains("Local shell: cmd.exe /c on the host."));
+            assertFalse(prompt.contains("Local shell: sh -c on the host."));
+        }
+    }
+
+    /** Reports a fixed shell family so the assertion does not depend on the host OS. */
+    private static final class FixedShellFilesystem extends LocalFilesystemWithShell {
+        private final ShellSyntax syntax;
+
+        FixedShellFilesystem(Path root, ShellSyntax syntax) {
+            super(root);
+            this.syntax = syntax;
+        }
+
+        @Override
+        public ShellSyntax shellSyntax() {
+            return syntax;
         }
     }
 }

@@ -481,8 +481,11 @@ public class WorkspaceContextMiddleware implements HarnessRuntimeMiddleware {
             sb.append("Use workspace-relative paths for file operations.\n");
         }
         if (localUpper != null || fs instanceof LocalFilesystemWithShell) {
+            // Ask the layer that runs the command: a bare overlay has no syntax of its own and
+            // would answer POSIX for any upper.
+            AbstractFilesystem shellOwner = localUpper != null ? localUpper : fs;
             sb.append("Local shell: ")
-                    .append(describeShell(ShellSyntax.of(fs)))
+                    .append(describeShell(ShellSyntax.of(shellOwner)))
                     .append(" on the host.\n");
         }
         if (artifactDeliveryEnabled && isPureSandbox(fs)) {

@@ -35,8 +35,13 @@ public enum ShellSyntax {
     POWERSHELL;
 
     /**
-     * Reports the syntax of the filesystem that will run the command. A wrapper that delegates
-     * {@code execute()} reports the backend's syntax itself, so only sandbox filesystems are asked.
+     * Reports the syntax of the filesystem that will run the command.
+     *
+     * <p>Only filesystems that implement {@link AbstractSandboxFilesystem} answer for themselves.
+     * A wrapper that is not one — such as a bare {@code OverlayFilesystem}, whose
+     * {@code execute()} delegates but which does not implement that interface — falls back to
+     * {@link #POSIX} here. Callers that can name the executing layer should ask that layer instead
+     * of the wrapper.
      *
      * @param filesystem filesystem the command runs on
      * @return shell syntax used by that filesystem

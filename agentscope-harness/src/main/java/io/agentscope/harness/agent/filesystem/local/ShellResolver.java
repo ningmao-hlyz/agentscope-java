@@ -53,6 +53,8 @@ final class ShellResolver {
         List<String> commandLine(String command) {
             if (syntax == ShellSyntax.POWERSHELL) {
                 // Redirected PowerShell output otherwise inherits the host console code page.
+                // Setting the console encoding also reaches native commands writing through it,
+                // so their output is UTF-8 as well.
                 command =
                         "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); "
                                 + command;
@@ -66,6 +68,7 @@ final class ShellResolver {
 
         Charset outputCharset(String osName, String nativeEncoding) {
             if (!isWindows(osName) || syntax != ShellSyntax.CMD) {
+                // PowerShell runs with the UTF-8 console prefix above; POSIX shells write UTF-8.
                 return StandardCharsets.UTF_8;
             }
             return nativeEncoding != null && Charset.isSupported(nativeEncoding)
@@ -87,9 +90,7 @@ final class ShellResolver {
                 configuredShellPath,
                 System.getProperty("os.name", ""),
                 environment,
-                // POSIX needs the executable bit; Windows has none, so there it only rules out
-                // directories.
-                path -> Files.isRegularFile(path) && Files.isExecutable(path));
+                ShellResolver::isRunnable);
     }
 
     /** Same as {@link #resolve(String, Map)} for an explicit host, so tests can reach both branches. */
@@ -113,6 +114,20 @@ final class ShellResolver {
 
     static boolean isWindows(String osName) {
         return osName != null && osName.toLowerCase(Locale.ROOT).contains("win");
+    }
+
+    /**
+     * Whether a located path can be launched.
+     *
+     * <p>POSIX needs the executable bit; Windows has none, so this only rules out directories. It
+     * deliberately accepts more than a regular file: a Store-installed {@code pwsh} is a runnable
+     * app-execution alias that {@code Files.exists} reports as absent.
+     *
+     * @param path candidate executable
+     * @return whether the path can be launched
+     */
+    static boolean isRunnable(Path path) {
+        return Files.isExecutable(path) && !Files.isDirectory(path);
     }
 
     /**
@@ -242,7 +257,7 @@ final class ShellResolver {
         if (name.equals("cmd") || name.equals("cmd.exe")) {
             return new ResolvedShell(executable, CMD_FLAG, ShellSyntax.CMD);
         }
-        if (name.startsWith("powershell") || name.equals("pwsh") || name.equals("pwsh.exe")) {
+        if (name.startsWith("powershell") || name.startsWith("pwsh")) {
             return new ResolvedShell(executable, POWERSHELL_FLAG, ShellSyntax.POWERSHELL);
         }
         return new ResolvedShell(executable, POSIX_FLAG, ShellSyntax.POSIX);

@@ -16,10 +16,12 @@
 package io.agentscope.harness.agent.filesystem.local;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeFalse;
 
+import io.agentscope.harness.agent.filesystem.ShellSyntax;
 import io.agentscope.harness.agent.filesystem.local.ShellResolver.ResolvedShell;
 import java.io.IOException;
 import java.nio.file.Files;
@@ -154,6 +156,21 @@ class ShellResolverTest {
     }
 
     @Test
+    void resolve_treatsPreviewPowerShellAsPowerShell(@TempDir Path dir) {
+        // The predicate stands in for the installed file; only the name selects the family here.
+        ResolvedShell resolved =
+                ShellResolver.resolve(
+                        "pwsh-preview.exe",
+                        "Windows 11",
+                        Map.of("PATH", dir.toString()),
+                        path -> true);
+
+        assertEquals("-Command", resolved.commandFlag());
+        assertEquals(ShellSyntax.POWERSHELL, resolved.syntax());
+        assertTrue(resolved.commandLine("echo hi").get(2).startsWith("[Console]::OutputEncoding"));
+    }
+
+    @Test
     void resolve_keepsCmdExeAsWindowsDefault() {
         // Switching the default would run every existing cmd command under a POSIX shell, so the
         // default stays the shell the host itself provides.
@@ -211,6 +228,28 @@ class ShellResolverTest {
         assertTrue(
                 thrown.getMessage().contains("not executable"),
                 "message should say it is not executable, was: " + thrown.getMessage());
+    }
+
+    @Test
+    void isRunnable_acceptsAnExecutableFile(@TempDir Path dir) throws IOException {
+        Path shell = Files.createFile(dir.resolve("shell"));
+        if (!isWindowsHost()) {
+            // Windows has no executable bit, so a created file is already runnable there.
+            Files.setPosixFilePermissions(shell, PosixFilePermissions.fromString("rwxr-xr-x"));
+        }
+
+        assertTrue(ShellResolver.isRunnable(shell));
+    }
+
+    @Test
+    void isRunnable_rejectsDirectories(@TempDir Path dir) {
+        // A directory carries the executable bit on POSIX, so this must exclude it explicitly.
+        assertFalse(ShellResolver.isRunnable(dir));
+    }
+
+    @Test
+    void isRunnable_rejectsMissingPaths(@TempDir Path dir) {
+        assertFalse(ShellResolver.isRunnable(dir.resolve("absent")));
     }
 
     private static boolean isWindowsHost() {
