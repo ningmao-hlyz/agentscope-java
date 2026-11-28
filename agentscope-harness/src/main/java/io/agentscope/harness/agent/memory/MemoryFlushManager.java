@@ -52,8 +52,9 @@ import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
 
 /**
- * Extracts facts into the daily memory ledger. {@code MEMORY.md} is read-only reference context;
- * {@link MemoryConsolidator} maintains it separately.
+ * Extracts facts into the daily memory ledger. This class is the only writer of
+ * {@code memory/YYYY-MM-DD.md}; {@code MEMORY.md} is read-only reference context here and is
+ * maintained separately by {@link MemoryConsolidator}.
  */
 public class MemoryFlushManager {
 
@@ -295,7 +296,8 @@ public class MemoryFlushManager {
         return admission.assess(input);
     }
 
-    private static List<String> candidates(String content) {
+    /** Package-private for unit testing of the candidate split without a model call. */
+    static List<String> candidates(String content) {
         List<String> result = new ArrayList<>();
         boolean continuation = false;
         for (String line : content.lines().toList()) {

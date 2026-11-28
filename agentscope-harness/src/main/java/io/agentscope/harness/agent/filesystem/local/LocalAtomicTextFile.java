@@ -37,6 +37,11 @@ public final class LocalAtomicTextFile implements AtomicTextFile {
     // Stripes bound lock memory while preventing overlapping JVM FileLocks on the same path.
     private static final ReentrantLock[] LOCKS = new ReentrantLock[64];
 
+    // Windows can deny opening a lock file or replacing the target while another process holds it.
+    // Retry a bounded number of times, then fail closed rather than degrade to a plain overwrite.
+    private static final int LOCK_OPEN_ATTEMPTS = 6;
+    private static final int REPLACE_ATTEMPTS = 4;
+
     static {
         for (int i = 0; i < LOCKS.length; i++) LOCKS[i] = new ReentrantLock();
     }
@@ -113,7 +118,7 @@ public final class LocalAtomicTextFile implements AtomicTextFile {
                 }
             } catch (AccessDeniedException denied) {
                 // Windows may deny opening a lock file while another process holds it.
-                if (attempt == 6) throw denied;
+                if (attempt == LOCK_OPEN_ATTEMPTS) throw denied;
                 backoff(attempt);
             }
         }
@@ -130,7 +135,7 @@ public final class LocalAtomicTextFile implements AtomicTextFile {
                 return;
             } catch (AccessDeniedException denied) {
                 // Windows may briefly deny replacement while a reader holds the target open.
-                if (attempt == 4) throw denied;
+                if (attempt == REPLACE_ATTEMPTS) throw denied;
                 backoff(attempt);
             }
         }

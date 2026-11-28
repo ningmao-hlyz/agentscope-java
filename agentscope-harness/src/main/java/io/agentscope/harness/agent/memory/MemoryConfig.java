@@ -64,7 +64,10 @@ public final class MemoryConfig {
     public enum FlushMode {
         /** Flush after every agent call. */
         ALWAYS,
-        /** Disable per-call memory extraction (native session logging still runs). */
+        /**
+         * Disable per-call memory extraction; compaction and overflow recovery still flush, and
+         * native session logging still runs.
+         */
         NEVER,
         /** Flush at most once per {@link FlushTrigger#minGap()}. */
         THROTTLED

@@ -58,7 +58,9 @@ import reactor.util.context.ContextView;
  * Extracts memories after each eligible call. Native journals supply only unconsumed original
  * messages; legacy execution uses the current context. Standalone calls queue background work,
  * while hosted executions finish extraction inside the recoverable finalization boundary.
- * Per-isolation-key queues serialize local writes and coalesce pending calls of one conversation.
+ * Per-isolation-key queues serialize local writes and coalesce pending calls of one conversation,
+ * and the throttle window follows that same key, so calls sharing memory data share one window.
+ * {@link MemoryConfig.FlushMode#NEVER} stops only this per-call hook.
  */
 public class MemoryFlushMiddleware implements HarnessRuntimeMiddleware {
 
@@ -78,13 +80,7 @@ public class MemoryFlushMiddleware implements HarnessRuntimeMiddleware {
 
     // Diagnostic deduplication only; eviction or restart may report a Thread again.
     private static final Map<String, Class<?>> FLUSH_WARNINGS =
-            Collections.synchronizedMap(
-                    new LinkedHashMap<>() {
-                        @Override
-                        protected boolean removeEldestEntry(Map.Entry<String, Class<?>> eldest) {
-                            return size() > 256;
-                        }
-                    });
+            Collections.synchronizedMap(new BoundedWarningCache());
 
     public MemoryFlushMiddleware(WorkspaceManager workspaceManager, Model model) {
         this(
@@ -362,8 +358,8 @@ public class MemoryFlushMiddleware implements HarnessRuntimeMiddleware {
                         ? ((ReActAgent) agent).threadKey(rc).storagePath()
                         : Objects.toString(rc.getSessionId(), "anonymous");
         String warningKey =
-                List.of(blankToEmpty(rc.getUserId()), thread, blankToEmpty(rc.getThreadId()))
-                        .toString();
+                String.join(
+                        "|", blankToEmpty(rc.getUserId()), thread, blankToEmpty(rc.getThreadId()));
         return flush.doOnSuccess(
                         v -> {
                             FLUSH_WARNINGS.remove(warningKey);
@@ -452,5 +448,16 @@ public class MemoryFlushMiddleware implements HarnessRuntimeMiddleware {
             case SESSION -> blankToEmpty(rc != null ? rc.getSessionId() : null);
             case AGENT, GLOBAL -> "";
         };
+    }
+
+    /** FIFO-bounded map for diagnostic deduplication; the oldest entry is evicted first. */
+    private static final class BoundedWarningCache extends LinkedHashMap<String, Class<?>> {
+        private static final long serialVersionUID = 1L;
+        private static final int MAX_ENTRIES = 256;
+
+        @Override
+        protected boolean removeEldestEntry(Map.Entry<String, Class<?>> eldest) {
+            return size() > MAX_ENTRIES;
+        }
     }
 }

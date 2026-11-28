@@ -71,7 +71,7 @@ Flush 只在完整的提炼流正常结束后追加提取的文字。明确因�
 
 `flushTimeout` 默认两分钟，覆盖一次触发内所有批次的抽取和串行准入。超时释放后台队列，或结束内联抽取并告警；已完成批次保留进度。日志包含 Thread、选定范围和最后确认的序号/偏移。保守配置可按 `flushTimeout > 所有批次预计抽取耗时 + 总候选数 × judge budget + IO 余量` 设置。256 条消息不限制模型调用次数，长消息会增加批次；judge budget 是耗时上限。批次持续超时会反复重做而无法提交，须增大 `flushTimeout` 或降低准入预算。旧模式没有保存位置，重试会重抽当前全量上下文。
 
-独立调用在后台排队抽取；Durable 托管调用在 finalization 内抽取，记录触发决定与日志范围供重放。托管工作区须通过 `RemoteFilesystem` 使用 `binding.workspace()` 才能获得 Durable IO 回执，普通本地文件访问不具备该能力。
+独立调用在后台排队抽取；Durable 托管调用在 finalization 内抽取，记录触发决定与日志范围供重放（Durable 适配器通过在 binding context 中设置 `MemoryFlushMiddleware.INLINE_CONTEXT_KEY` 进入该模式）。托管工作区须通过 `RemoteFilesystem` 使用 `binding.workspace()` 才能获得 Durable IO 回执，普通本地文件访问不具备该能力。
 
 `flushTrigger` 控制原生每轮抽取（`ALWAYS`、`NEVER`、`THROTTLED`），原生压缩只保留原文。`journalEnabled(false)` 保留当前上下文和压缩前抽取，但无持久进度或同等恢复保证；公开的 `flushMemories(rc, messages)` 保留显式输入语义。
 

@@ -98,11 +98,13 @@ final class JournalMemoryFlush {
                                             .findFirst()
                                             .map(JournalEvent::eventId)
                                             .orElse("");
-                            if (before != null
+                            boolean anchorMismatch =
+                                    before != null
                                             && (position.after() > 0
                                                     || !position.anchor().isEmpty())
-                                            && !anchor.equals(position.anchor())
-                                    || position.after() > journal.head().seq())
+                                            && !anchor.equals(position.anchor());
+                            boolean positionBeyondHead = position.after() > journal.head().seq();
+                            if (anchorMismatch || positionBeyondHead)
                                 return Mono.error(
                                         new IllegalStateException(
                                                 "Memory progress does not match this Thread"
@@ -365,6 +367,11 @@ final class JournalMemoryFlush {
         return new Batch(next, text.toString());
     }
 
+    /**
+     * Longest prefix of {@code remaining} that still fits the budget. The estimate counts the whole
+     * prompt, so a message that fits costs one estimate; only an oversized one pays for a binary
+     * search over code-point boundaries.
+     */
     private int prefix(String accepted, String remaining, String known, String recent, long limit) {
         if (remaining.isEmpty() || fits(accepted + remaining, known, recent, limit))
             return remaining.length();

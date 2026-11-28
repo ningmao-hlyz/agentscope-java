@@ -197,4 +197,27 @@ class MemoryFlushManagerTest {
             return text(inputs.get(index).get(1));
         }
     }
+
+    @Test
+    void candidates_splitBulletsAndKeepIndentedContinuations() {
+        String content =
+                """
+                - first fact
+                  continued detail
+                * second fact
+                1. third fact
+                trailing prose without a marker
+                """;
+
+        assertEquals(
+                List.of("- first fact\n  continued detail", "* second fact", "1. third fact"),
+                MemoryFlushManager.candidates(content));
+    }
+
+    @Test
+    void candidates_treatProseWithoutMarkersAsOneCandidate() {
+        assertEquals(
+                List.of("- one fact\n and its detail"),
+                MemoryFlushManager.candidates("one fact\n and its detail"));
+    }
 }
